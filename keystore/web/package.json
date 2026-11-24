@@ -34,25 +34,17 @@
     "release:dry-run": "package-releaser --dry-run"
   },
   "dependencies": {
-    "@algorandfoundation/dp256": "catalog:",
-    "@algorandfoundation/keystore-core": "workspace:*",
-    "@algorandfoundation/wallet-provider": "catalog:",
-    "@algorandfoundation/xhd-wallet-api": "catalog:",
-    "@scure/bip39": "catalog:",
-    "falcon-1024": "catalog:"
-  },
-  "devDependencies": {
-    "@algorandfoundation/log-store": "workspace:*",
-    "@algorandfoundation/package-releaser": "workspace:^",
-    "@tanstack/store": "catalog:",
-    "fake-indexeddb": "^6.2.5",
-    "typedoc": "catalog:",
-    "vitest": "catalog:"
+    "@algorandfoundation/dp256": "^1.1.0",
+    "@algorandfoundation/keystore-core": ">=1.0.0-canary.5",
+    "@algorandfoundation/wallet-provider": "^1.0.0-canary.5",
+    "@algorandfoundation/xhd-wallet-api": "^2.0.0-canary.1",
+    "@scure/bip39": "^1.5.0",
+    "falcon-1024": "^0.2.0"
   },
   "peerDependencies": {
-    "@algorandfoundation/log-store": "workspace:*",
-    "@tanstack/store": "catalog:",
-    "before-after-hook": "catalog:"
+    "@algorandfoundation/log-store": "*",
+    "@tanstack/store": "^0.11.2",
+    "before-after-hook": "^4.0.0"
   },
   "peerDependenciesMeta": {
     "@algorandfoundation/log-store": {

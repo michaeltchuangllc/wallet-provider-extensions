@@ -1,0 +1,1578 @@
+/**
+ * The shared, platform-neutral keystore orchestrator.
+ *
+ * {@link createKeyStore} implements the {@link KeyStoreAPI} on top of two
+ * injected seams and nothing else:
+ *
+ * - a **host {@link SubtleCrypto}** (plus an optional array of composable
+ *   {@link SubtleShim} decorators layered over it), which performs all
+ *   cryptography, and
+ * - a **{@link KeyStoreDriver}**, which owns encrypted-at-rest persistence of
+ *   material and metadata plus any platform-specific unlock flow.
+ *
+ * The orchestrator itself is crypto-only: it fetches + decrypts material
+ * just-in-time via {@link KeyStoreDriver.use}, injects it into the shim
+ * algorithm parameters for a single operation, and mirrors only UI-safe
+ * metadata into the reactive {@link KeyStoreState} store. This is the body that
+ * used to live inside the browser engine; every backend now supplies a driver
+ * instead of copying it.
+ */
+import { DEFAULT_HOST_ALGORITHMS } from "./constants.js";
+import { createDefaultShims } from "./defaults.js";
+import { InvalidKeyDataError, InvalidKeyFormatError, KeyNotFoundError } from "./errors.js";
+import { HPKE_P256_POINT_LENGTH, hpkeOpenAuth, hpkeSealAuth } from "./hpke.js";
+import { BIP32DerivationType, consumeKeyMaterial, createKeyHandle, } from "./shims/index.js";
+/**
+ * Casts a `Uint8Array` to the strict `BufferSource` overload WebCrypto expects.
+ * The primitive libraries and decrypted buffers are `Uint8Array<ArrayBufferLike>`,
+ * which the DOM lib's `ArrayBuffer`-parameterised `BufferSource` rejects.
+ */
+function bs(bytes) {
+    return bytes;
+}
+/**
+ * The fixed 16-byte PKCS#8 DER prefix for an Ed25519 private key (RFC 8410):
+ * `SEQUENCE { version 0, AlgorithmIdentifier { id-Ed25519 }, PrivateKey OCTET
+ * STRING(OCTET STRING(seed)) }`. Concatenated with the 32-byte seed, it yields
+ * a complete 48-byte PKCS#8 document the host Subtle can import.
+ */
+const ED25519_PKCS8_PREFIX = new Uint8Array([
+    0x30, 0x2e, 0x02, 0x01, 0x00, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x04, 0x22, 0x04, 0x20,
+]);
+/** Wraps a 32-byte Ed25519 seed into a complete PKCS#8 DER document. */
+function seedToEd25519Pkcs8(seed) {
+    const pkcs8 = new Uint8Array(ED25519_PKCS8_PREFIX.byteLength + seed.byteLength);
+    pkcs8.set(ED25519_PKCS8_PREFIX, 0);
+    pkcs8.set(seed, ED25519_PKCS8_PREFIX.byteLength);
+    return pkcs8;
+}
+/**
+ * Unwraps the 32-byte Ed25519 seed from the PKCS#8 document produced by
+ * {@link seedToEd25519Pkcs8} — the layout every byte-persisted Ed25519 record
+ * is sealed in, and the shape {@link KeyData.privateKey} is defined as for
+ * `ed25519` keys (so an `export` round-trips through `import` unchanged).
+ */
+function ed25519Pkcs8ToSeed(pkcs8) {
+    if (pkcs8.byteLength !== ED25519_PKCS8_PREFIX.byteLength + 32 ||
+        !bytesEqual(pkcs8.subarray(0, ED25519_PKCS8_PREFIX.byteLength), ED25519_PKCS8_PREFIX)) {
+        throw new InvalidKeyFormatError("stored Ed25519 material is not a seed PKCS#8 document");
+    }
+    return Uint8Array.from(pkcs8.subarray(ED25519_PKCS8_PREFIX.byteLength));
+}
+/** Decodes an unpadded base64url string (as used by JWK members) into bytes. */
+function base64UrlToBytes(value) {
+    const base64 = value.replace(/-/g, "+").replace(/_/g, "/");
+    const padded = base64 + "=".repeat((4 - (base64.length % 4)) % 4);
+    const binary = atob(padded);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i += 1)
+        bytes[i] = binary.charCodeAt(i);
+    return bytes;
+}
+/** True when `a` and `b` hold the same bytes. */
+function bytesEqual(a, b) {
+    if (a.byteLength !== b.byteLength)
+        return false;
+    for (let i = 0; i < a.byteLength; i += 1) {
+        if (a[i] !== b[i])
+            return false;
+    }
+    return true;
+}
+/**
+ * The generation inputs THIS engine consumes as secrets. Metadata is stored in
+ * PLAINTEXT — mirrored into the reactive store, pushed over RPC and persisted
+ * unencrypted (IndexedDB metadata store, the MMKV `k/` bucket, Node's metadata
+ * file) — so these are dropped before the rest of `params` is recorded.
+ *
+ * Deliberately limited to what the engine itself reads: an inline `seed` or
+ * `entropy`, the BIP39 `passphrase` and the PBKDF2 `salt`. Existing key
+ * material belongs in {@link KeyStoreAPI.import} / {@link
+ * KeyStoreAPI.importSeed} and is referenced by `parentKeyId` afterwards, and
+ * anything else a caller chooses to put in `params` is THEIR metadata: the
+ * engine records it verbatim rather than guessing at names like `password` or
+ * `secret`.
+ */
+const SECRET_PARAM_KEYS = ["seed", "entropy", "passphrase", "salt"];
+/**
+ * Strips every {@link SECRET_PARAM_KEYS} member from a `params` bag, yielding
+ * the subset that is safe to persist as plaintext metadata. Always use this
+ * instead of spreading `options.params` straight into a metadata record.
+ */
+function publicParams(params) {
+    const safe = {};
+    for (const [name, value] of Object.entries(params ?? {})) {
+        if (SECRET_PARAM_KEYS.includes(name))
+            continue;
+        safe[name] = value;
+    }
+    return safe;
+}
+/** Parses a BIP44 path string (e.g. `"m/44'/283'/0'/0/0"`) into segments. */
+function parsePath(path) {
+    return path
+        .replace(/^m\/?/, "")
+        .split("/")
+        .filter((part) => part.length > 0)
+        .map((part) => {
+        const hardened = part.endsWith("'") || part.endsWith("h");
+        const index = Number.parseInt(part.replace(/['h]$/, ""), 10);
+        if (Number.isNaN(index)) {
+            throw new InvalidKeyFormatError(`invalid BIP44 path segment: ${part}`);
+        }
+        return hardened ? index + 0x80_00_00_00 : index;
+    });
+}
+/** Algorithm a secp256k1 shim registers; the engine routes derive, import and sign to it. */
+const SECP256K1_ALGORITHM = "ECDSA-secp256k1";
+/**
+ * Strict BIP-32 path check (`m/…`, `'` for hardened, indices below 2^31), run
+ * before a parent's entropy is opened so a malformed path never decrypts it.
+ */
+function assertBip32Path(path) {
+    const [root, ...segments] = path.split("/");
+    const valid = root === "m" &&
+        segments.every((part) => {
+            const match = /^(\d+)'?$/.exec(part);
+            return match !== null && Number(match[1]) < 0x80_00_00_00;
+        });
+    if (!valid) {
+        throw new InvalidKeyFormatError(`invalid BIP-32 path: ${path}`);
+    }
+}
+/**
+ * Suffix of the secret-store id holding a mnemonic seed's sealed passphrase
+ * (the BIP39 "25th word"), used when a seed is generated with
+ * `params.storePassphrase`. The owning seed records the resulting id under
+ * `metadata.passphraseSecretId`; the secret itself is an ordinary secret-store
+ * entry, so it can be read, listed and removed like any other secret.
+ */
+const PASSPHRASE_SECRET_SUFFIX = ".passphrase";
+/**
+ * Version byte prefixing {@link KeyStoreAPI.encryptWithKey} ciphertext.
+ *
+ * Version 1 was the retired scheme that keyed the cipher off the key's
+ * **public** bytes (mirroring the original backend's hash-of-public-key
+ * secretbox): anyone holding the public key could re-derive its symmetric key,
+ * so version-1 ciphertexts are rejected rather than decrypted.
+ */
+const ENCRYPT_VERSION = 2;
+/** HKDF `info` binding the derived AES key to this keystore's encrypt scheme. */
+const ENCRYPT_INFO = new TextEncoder().encode("keystore-encrypt-v2");
+/**
+ * Version byte prefixing **peer** (recipient-addressed) `encryptWithKey`
+ * ciphertext: an HPKE (RFC 9180) Auth-mode seal between this key's private
+ * material and the recipient's public key. Self-encrypted payloads keep
+ * {@link ENCRYPT_VERSION}; the two framings coexist and `decryptWithKey`
+ * dispatches on the byte.
+ */
+const ENCRYPT_VERSION_PEER = 3;
+/**
+ * Suite byte inside the peer framing. `1` is the only suite so far:
+ * `DHKEM(P-256, HKDF-SHA256)` + `HKDF-SHA256` + `AES-128-GCM`.
+ */
+const ENCRYPT_PEER_SUITE = 1;
+/** HPKE `info` binding peer ciphertexts to this keystore's encrypt scheme. */
+const ENCRYPT_PEER_INFO = new TextEncoder().encode("keystore-encrypt-v3");
+/**
+ * Peer framing: `[version(1) | suite(1) | senderPub(65) | enc(65) | ct]` — the
+ * header is everything before the AEAD ciphertext.
+ */
+const ENCRYPT_PEER_HEADER_LENGTH = 2 + HPKE_P256_POINT_LENGTH * 2;
+/**
+ * Derives an AES-GCM key from a key's **private** bytes via the host Subtle
+ * (HKDF-SHA-256 over the sealed private material, salted with the public key so
+ * the derived key is bound to the pair). The private bytes are only ever
+ * available inside {@link KeyStoreDriver.use}, so encrypting and decrypting
+ * require the same unlock as any other material-touching operation — this is
+ * what gives `encryptWithKey`/`decryptWithKey` confidentiality against anyone
+ * who merely knows the public key.
+ */
+async function deriveAesKeyFromPrivate(host, privateBytes, publicKey) {
+    const base = await host.importKey("raw", privateBytes, "HKDF", false, [
+        "deriveKey",
+    ]);
+    return host.deriveKey({
+        name: "HKDF",
+        hash: "SHA-256",
+        salt: (publicKey ?? new Uint8Array(0)),
+        info: ENCRYPT_INFO,
+    }, base, { name: "AES-GCM", length: 256 }, false, ["encrypt", "decrypt"]);
+}
+/**
+ * Resolves the AES-GCM key that seals {@link KeyStoreAPI.encryptWithKey}
+ * ciphertext from whatever material the driver unsealed:
+ *
+ * - `bytes` — HKDF-SHA-256 over the sealed private bytes
+ *   ({@link deriveAesKeyFromPrivate}), the byte-only-backend scheme.
+ * - a native `AES-GCM` {@link CryptoKey} — the stored key itself, handed
+ *   straight to the host so the material never surfaces as bytes.
+ * - a native `ECDH`/`X25519` {@link CryptoKey} — a **self-agreement** (the
+ *   private key against its own public key), a secret only the private-key
+ *   holder can compute, folded through the same HKDF. With a `deriveKey`-only
+ *   key the agreement stays entirely inside the host.
+ *
+ * The source is a fixed property of how the key is persisted, so encrypt and
+ * decrypt always resolve the same AES key for a given id. Any other native key
+ * (a signature-only Ed25519/ECDSA `CryptoKey`, whose WebCrypto usages permit
+ * neither encryption nor key agreement) throws — no secret path to an
+ * encryption key exists for it.
+ */
+async function aesKeyFromMaterial(host, material, publicKeyBytes, id) {
+    if (material.kind === "bytes") {
+        return deriveAesKeyFromPrivate(host, material.bytes, publicKeyBytes);
+    }
+    const { privateKey, publicKey } = material;
+    const name = privateKey.algorithm.name;
+    // A native AES-GCM key encrypts directly; nothing to derive.
+    if (name === "AES-GCM")
+        return privateKey;
+    if ((name === "ECDH" || name === "X25519") && publicKey) {
+        const agreement = { name, public: publicKey };
+        if (privateKey.usages.includes("deriveBits")) {
+            const shared = new Uint8Array(await host.deriveBits(agreement, privateKey, 256));
+            try {
+                return await deriveAesKeyFromPrivate(host, shared, publicKeyBytes);
+            }
+            finally {
+                shared.fill(0);
+            }
+        }
+        if (privateKey.usages.includes("deriveKey")) {
+            // `deriveKey`-only key: agree directly into an AES-GCM key so the shared
+            // secret never exists as bytes in JS.
+            return host.deriveKey(agreement, privateKey, { name: "AES-GCM", length: 256 }, false, [
+                "encrypt",
+                "decrypt",
+            ]);
+        }
+    }
+    throw new InvalidKeyDataError(`key ${id} holds a non-extractable ${name} CryptoKey whose usages permit neither encryption nor key agreement`);
+}
+/**
+ * Normalizes an EC public key to the uncompressed P-256 point the HPKE peer
+ * scheme frames and agrees against: a 65-byte point passes through, anything
+ * else is treated as an SPKI document (the shape byte-backed EC records mirror
+ * into {@link Key.publicKey}) and re-exported raw.
+ */
+async function toRawP256Point(host, publicKey) {
+    if (publicKey.byteLength === HPKE_P256_POINT_LENGTH && publicKey[0] === 4) {
+        return publicKey;
+    }
+    const imported = await host.importKey("spki", bs(publicKey), { name: "ECDH", namedCurve: "P-256" }, true, []);
+    return new Uint8Array(await host.exportKey("raw", imported));
+}
+/**
+ * Resolves a key's material into the ECDH pair the HPKE peer scheme needs — a
+ * `deriveBits`-capable P-256 private `CryptoKey` plus the matching
+ * uncompressed public point:
+ *
+ * - a native `ECDH` `CryptoKey` is used as-is (its public half re-exported
+ *   raw), provided its usages include `deriveBits` — HPKE concatenates raw DH
+ *   outputs, which `deriveKey` alone cannot produce;
+ * - byte-backed `ECDH` material is re-imported from its sealed PKCS#8 document
+ *   just-in-time, with the public point taken from the metadata mirror.
+ *
+ * Anything else — signing keys, XHD/HD-derived keys, non-P-256 curves —
+ * throws: peer encryption deliberately requires a key generated for
+ * derivation (`keyUsages: ["deriveBits", ...]`). XHD agreements go through
+ * `deriveSharedSecret` instead.
+ */
+async function resolveEcdhPair(host, material, key, id) {
+    if (material.kind === "cryptokey") {
+        const name = material.privateKey.algorithm.name;
+        if (name !== "ECDH") {
+            throw new InvalidKeyDataError(`key ${id} is a ${name} key; peer encryption requires an ECDH P-256 key generated for derivation (use deriveSharedSecret for XHD keys, or generate a dedicated ECDH key)`);
+        }
+        if (!material.privateKey.usages.includes("deriveBits")) {
+            throw new InvalidKeyDataError(`key ${id} lacks the "deriveBits" usage peer encryption requires; generate the key with keyUsages ["deriveBits"]`);
+        }
+        if (!material.publicKey) {
+            throw new InvalidKeyDataError(`key ${id} has no public key to run a key agreement with`);
+        }
+        return {
+            privateKey: material.privateKey,
+            publicKey: new Uint8Array(await host.exportKey("raw", material.publicKey)),
+        };
+    }
+    const namedCurve = key.metadata?.namedCurve ?? "P-256";
+    if (key.algorithm !== "ECDH" || namedCurve !== "P-256") {
+        throw new InvalidKeyDataError(`key ${id} (${key.algorithm}) is not an ECDH P-256 key; peer encryption requires one generated for derivation (use deriveSharedSecret for XHD keys, or generate a dedicated ECDH key)`);
+    }
+    if (!key.publicKey) {
+        throw new InvalidKeyDataError(`key ${id} has no public key to run a key agreement with`);
+    }
+    const privateKey = await host.importKey("pkcs8", bs(material.bytes), { name: "ECDH", namedCurve }, false, ["deriveBits"]);
+    return { privateKey, publicKey: await toRawP256Point(host, key.publicKey) };
+}
+/** Whether `key` is a genuine host {@link CryptoKey} rather than a shim's look-alike handle. */
+function isHostCryptoKey(key) {
+    return typeof CryptoKey !== "undefined" && key instanceof CryptoKey;
+}
+/** Whether every key in a `generateKey` result is a genuine host {@link CryptoKey}. */
+function isHostKeyResult(result) {
+    return "privateKey" in result
+        ? isHostCryptoKey(result.privateKey) && isHostCryptoKey(result.publicKey)
+        : isHostCryptoKey(result);
+}
+/** Wipes any birth material a discarded shim handle (or pair) still carries. */
+function discardHandles(result) {
+    const keys = "privateKey" in result ? [result.privateKey, result.publicKey] : [result];
+    for (const key of keys) {
+        try {
+            consumeKeyMaterial(key, () => undefined);
+        }
+        catch {
+            // No material attached (or not a shim handle): nothing to wipe.
+        }
+    }
+}
+/**
+ * Creates a keystore that fulfils the {@link KeyStoreAPI} by orchestrating an
+ * injected host {@link SubtleCrypto} (with any composable {@link SubtleShim}
+ * decorators layered over it for BIP32-Ed25519 / Falcon-1024 / …) and an
+ * injected {@link KeyStoreDriver} for persistence.
+ *
+ * Standard host keys (Ed25519, ECDSA, AES, …) are persisted as non-extractable
+ * {@link CryptoKey}s when the driver supports it
+ * ({@link DriverCapabilities.nativeCryptoKey}), otherwise serialized to sealed
+ * bytes. Shim keys (BIP32-Ed25519 roots, Falcon private keys) and raw seeds are
+ * always stored as bytes the driver encrypts at rest. Secret material is
+ * decrypted just-in-time inside {@link KeyStoreDriver.use}, injected into the
+ * shim algorithm parameters and wiped once the operation completes. The
+ * reactive `store` mirrors only UI-safe metadata.
+ *
+ * @typeParam Ctx - The driver's per-operation context, threaded verbatim
+ *   through the returned API's material-touching methods.
+ * @param options - {@link CreateKeyStoreOptions}.
+ * @returns A {@link KeyStore} (a `KeyStoreAPI` plus a `ready` promise).
+ *
+ * @example
+ * ```typescript
+ * const keystore = createKeyStore({
+ *   driver,
+ *   store,
+ *   shims: [(host) => withSubtleXHD(host, xhd), (host) => withSubtleFalcon1024(host, falcon)],
+ * });
+ * await keystore.ready;
+ * const id = await keystore.generate({
+ *   type: "ed25519",
+ *   algorithm: "EdDSA",
+ *   extractable: false,
+ *   keyUsages: ["sign", "verify"],
+ * });
+ * const signature = await keystore.sign(id, new TextEncoder().encode("hi"));
+ * ```
+ */
+export function createKeyStore(options) {
+    const { driver, store } = options;
+    const host = options.subtle ?? globalThis.crypto.subtle;
+    const native = driver.capabilities.nativeCryptoKey;
+    // Layer the composable shims over the host, in order, so a single Subtle
+    // understands the extra algorithms; unknown algorithms fall straight through
+    // to the host, and an operation needing a shim that was not supplied surfaces
+    // the host's own "unsupported algorithm" error.
+    //
+    // The default shim stack ({@link createDefaultShims}) loads its optional
+    // crypto libraries lazily, so resolving it is async. It is folded into the
+    // `ready` promise; every material-touching method `await ready` before it
+    // touches `subtle`, so the stack is always fully layered by then.
+    let subtle = host;
+    const ready = (async () => {
+        const shimsOption = options.shims;
+        const shims = shimsOption === undefined
+            ? await createDefaultShims()
+            : typeof shimsOption === "function"
+                ? await shimsOption()
+                : shimsOption;
+        for (const shim of shims)
+            subtle = shim(subtle);
+        await driver.ready;
+        const keys = (await driver.listMeta()).filter(Boolean);
+        // Surface the keystore's cryptographic capabilities from the reactive state,
+        // each tagged with its source: the standard host algorithms (a documented
+        // baseline, since WebCrypto is not enumerable) plus the composable shim
+        // add-ons that are actually active (each shim carries its `algorithm` when
+        // tagged via `tagShim`).
+        const hostAlgorithms = options.hostAlgorithms ?? DEFAULT_HOST_ALGORITHMS;
+        const algorithms = [
+            ...hostAlgorithms.map((algorithm) => ({ algorithm, source: "host" })),
+            ...shims
+                .map((shim) => shim.algorithm)
+                .filter((name) => typeof name === "string")
+                .map((algorithm) => ({ algorithm, source: "shim" })),
+        ];
+        store.setState(() => ({ keys, status: "idle", algorithms }));
+    })();
+    const setStatus = (status) => {
+        store.setState((s) => ({ ...s, status }));
+    };
+    const addMetadata = async (key) => {
+        await driver.putMeta(key);
+        store.setState((s) => ({ ...s, keys: [key, ...s.keys.filter((k) => k.id !== key.id)] }));
+    };
+    const loadMetadata = async (id) => {
+        const inMemory = store.state.keys.find((k) => k.id === id);
+        if (inMemory)
+            return inMemory;
+        const persisted = await driver.getMeta(id);
+        if (!persisted)
+            throw new KeyNotFoundError(id);
+        return persisted;
+    };
+    /** The mnemonic seed schemes stored as recoverable entropy (see `withSubtleBIP39`). */
+    const isMnemonicScheme = (scheme) => scheme === "bip39" || scheme === "algo25";
+    /**
+     * Converts a mnemonic scheme's stored **entropy** into the actual derivation
+     * **seed** via the corresponding seed shim (`entropy → seed`). For `bip39`
+     * this runs PBKDF2 (16/32 → 64 bytes); for `algo25` the entropy already is the
+     * 32-byte seed. The injected `entropy` buffer is wiped by the shim.
+     */
+    const seedFromMnemonicEntropy = async (scheme, entropy, passphrase) => {
+        const name = scheme === "algo25" ? "Algo25" : "BIP39";
+        const handle = createKeyHandle("private", { name }, false, ["deriveBits"]);
+        return new Uint8Array((await subtle.deriveBits({ name, entropy, passphrase }, handle)));
+    };
+    /** Persists secret bytes for `id`; the driver seals them at rest. */
+    const putBytes = (id, bytes, ctx) => driver.put(id, { kind: "bytes", bytes }, ctx);
+    /**
+     * Runs `fn` with the seed bytes for a generation, sourced either inline
+     * (`params.seed`) or by resolving a parent seed id through the driver.
+     *
+     * When the resolved parent is a mnemonic seed (its metadata carries
+     * `scheme: "bip39" | "algo25"`) and `opts.wantSeed` is true (the default), the
+     * stored **entropy** is first converted to the derivation **seed** via the
+     * seed shim. Consumers that instead want the raw stored bytes (e.g. the dp256
+     * main key, which PBKDF2s the entropy itself) pass `wantSeed: false`. Legacy
+     * seeds (no scheme) are always passed through unchanged.
+     */
+    const withSeed = async (params, ctx, fn, opts = {}) => {
+        const wantSeed = opts.wantSeed ?? true;
+        if (params?.seed instanceof Uint8Array) {
+            const seed = Uint8Array.from(params.seed);
+            try {
+                return await fn(seed);
+            }
+            finally {
+                seed.fill(0);
+            }
+        }
+        if (typeof params?.parentKeyId === "string") {
+            const parentKeyId = params.parentKeyId;
+            const parentMeta = await loadMetadata(parentKeyId);
+            const scheme = parentMeta.metadata?.scheme;
+            // An explicit `params.passphrase` always wins; otherwise fall back to the
+            // one sealed with the seed (opt-in, see `putPassphraseSecret`). Resolved
+            // BEFORE unlocking the parent so the two `driver.use` calls never nest.
+            const passphrase = params.passphrase ??
+                (wantSeed && isMnemonicScheme(scheme)
+                    ? await readPassphraseSecret(parentMeta, ctx)
+                    : undefined);
+            return driver.use(parentKeyId, ctx, async (m) => {
+                if (m.kind !== "bytes") {
+                    throw new InvalidKeyDataError(`parent ${parentKeyId} does not hold seed bytes`);
+                }
+                if (wantSeed && isMnemonicScheme(scheme)) {
+                    const seed = await seedFromMnemonicEntropy(scheme, m.bytes, passphrase);
+                    try {
+                        return await fn(seed);
+                    }
+                    finally {
+                        seed.fill(0);
+                    }
+                }
+                return fn(m.bytes);
+            });
+        }
+        throw new InvalidKeyDataError("a seed (params.seed) or params.parentKeyId is required");
+    };
+    /**
+     * Seals `passphrase` under `secretId` as an ordinary secret-store entry and
+     * records which seed it belongs to. Only ever called for a seed generated
+     * with `params.storePassphrase: true`.
+     */
+    const putPassphraseSecret = async (secretId, seedId, passphrase, ctx) => {
+        const bytes = new TextEncoder().encode(passphrase);
+        try {
+            await putBytes(secretId, bytes, ctx);
+        }
+        finally {
+            bytes.fill(0);
+        }
+        await addMetadata({
+            id: secretId,
+            type: "secret-key",
+            algorithm: "raw",
+            extractable: false,
+            keyUsages: [],
+            metadata: { storage: "bytes", name: "Seed passphrase", passphraseFor: seedId },
+            version: 1,
+        });
+    };
+    /**
+     * Reads the passphrase sealed with `seedMeta`, or `undefined` when the seed
+     * has none. A recorded-but-unreadable secret THROWS rather than deriving
+     * without it: silently dropping the passphrase would mint a different (and
+     * wrong) key from the same entropy.
+     */
+    const readPassphraseSecret = async (seedMeta, ctx) => {
+        const secretId = seedMeta.metadata?.passphraseSecretId;
+        if (typeof secretId !== "string")
+            return undefined;
+        return driver.use(secretId, ctx, (m) => {
+            if (m.kind !== "bytes") {
+                throw new InvalidKeyDataError(`secret ${secretId} does not hold bytes`);
+            }
+            return new TextDecoder().decode(m.bytes);
+        });
+    };
+    /**
+     * Generates a fresh mnemonic **seed** (`type: "seed"`) via the BIP39 or Algo25
+     * shim. Only the recoverable **entropy** is persisted (sealed at rest) —
+     * `metadata.scheme` records which mnemonic scheme it belongs to so the phrase
+     * can be reconstructed and downstream derivation can convert entropy → seed
+     * just-in-time. The scheme is taken from `params.scheme`, else inferred from
+     * `algorithm` (`"Algo25"` ⇒ `algo25`, otherwise `bip39`).
+     *
+     * A `params.passphrase` (the BIP39 "25th word") is NOT persisted by default —
+     * `metadata.protected` merely records that one is required, and every later
+     * derivation must supply it again. Passing `params.storePassphrase: true`
+     * opts into sealing it in the secret store next to the seed (the id is
+     * recorded as `metadata.passphraseSecretId`), after which {@link withSeed}
+     * resolves it automatically. That is a deliberate trade-off: it keeps the
+     * 25th word on the device, where it is only as safe as the driver's
+     * encryption at rest.
+     */
+    const generateSeed = async (options, id, ctx) => {
+        const scheme = isMnemonicScheme(options.params?.scheme)
+            ? options.params.scheme
+            : options.algorithm === "Algo25"
+                ? "algo25"
+                : "bip39";
+        const name = scheme === "algo25" ? "Algo25" : "BIP39";
+        const strength = options.params?.strength;
+        const passphrase = options.params?.passphrase;
+        // Never persist secrets/config into (plaintext) metadata.
+        const safeParams = publicParams(options.params);
+        const key = (await subtle.generateKey({ name, strength }, false, ["deriveBits", "deriveKey"]));
+        // Capture the just-born entropy once and persist it encrypted at rest.
+        await consumeKeyMaterial(key, (m) => putBytes(id, Uint8Array.from(m), ctx));
+        // Opt-in only: seal the passphrase beside the entropy so later derivations
+        // resolve it without asking again.
+        const passphraseSecretId = passphrase !== undefined && options.params?.storePassphrase === true
+            ? `${id}${PASSPHRASE_SECRET_SUFFIX}`
+            : undefined;
+        if (passphraseSecretId !== undefined) {
+            await putPassphraseSecret(passphraseSecretId, id, passphrase, ctx);
+        }
+        await addMetadata({
+            id,
+            type: "seed",
+            algorithm: "raw",
+            extractable: false,
+            keyUsages: ["deriveBits", "deriveKey"],
+            // A BIP39 passphrase (the "25th word") is never stored in metadata;
+            // `protected` merely records that one is required to reconstruct the seed
+            // from the entropy, and `passphraseSecretId` points at the sealed copy
+            // when the caller opted into storing it.
+            metadata: {
+                storage: "bytes",
+                scheme,
+                protected: passphrase ? true : undefined,
+                passphraseSecretId,
+                ...safeParams,
+            },
+            version: 1,
+        });
+        return id;
+    };
+    const generateHDRoot = async (options, id, ctx) => {
+        const seedId = options.params?.parentKeyId;
+        await withSeed(options.params, ctx, async (seed) => {
+            // The shim derives the 96-byte root and wipes the seed we injected.
+            const root = (await subtle.generateKey({ name: "BIP32-Ed25519", seed }, false, ["sign"]));
+            // Capture the just-born root once and persist it encrypted at rest.
+            await consumeKeyMaterial(root, (m) => putBytes(id, Uint8Array.from(m), ctx));
+        });
+        await addMetadata({
+            id,
+            type: "hd-root-key",
+            algorithm: "raw",
+            extractable: false,
+            keyUsages: ["deriveBits", "deriveKey"],
+            // `scheme` disambiguates the two kinds of `hd-root-key`: the XHD
+            // BIP32-Ed25519 root (this one) vs. the deterministic-P256 PBKDF2 main
+            // key. Legacy records predate this flag; an absent `scheme` is treated as
+            // `bip32-ed25519`.
+            metadata: {
+                storage: "bytes",
+                scheme: "bip32-ed25519",
+                parentKeyId: seedId,
+                ...publicParams(options.params),
+            },
+            version: 1,
+        });
+        return id;
+    };
+    /**
+     * Generates a deterministic-P256 (passkey) **main key** — the PBKDF2-HMAC-SHA512
+     * root of the passkey hierarchy. It shares the `hd-root-key` type with the XHD
+     * root but is distinguished by `algorithm: "P256"` + `metadata.scheme:
+     * "pbkdf2-p256"`, so no new {@link KeyType} is introduced. Domain passkeys are
+     * later derived from it via {@link KeyStoreAPI.deriveDomainKey}.
+     */
+    const generateDP256Main = async (options, id, ctx) => {
+        const parentKeyId = options.params?.parentKeyId;
+        // Never persist raw secrets into (plaintext) metadata — strip any inline
+        // entropy/seed/salt/passphrase the caller passed for generation.
+        const safeParams = publicParams(options.params);
+        await withSeed(options.params, ctx, async (entropy) => {
+            // The shim derives the PBKDF2 main key and wipes the entropy we injected.
+            const main = (await subtle.generateKey({
+                name: "Deterministic-P256",
+                entropy,
+                salt: options.params?.salt,
+                iterationCount: options.params?.iterationCount,
+                keyLengthBytes: options.params?.keyLengthBytes,
+            }, false, ["sign"]));
+            // Capture the just-born main key once and persist it encrypted at rest.
+            await consumeKeyMaterial(main, (m) => putBytes(id, Uint8Array.from(m), ctx));
+            // dp256 PBKDF2s the raw stored bytes itself, so keep the parent's entropy
+            // (do not convert a mnemonic seed record's entropy to its derived seed).
+        }, { wantSeed: false });
+        await addMetadata({
+            id,
+            type: "hd-root-key",
+            algorithm: "P256",
+            extractable: false,
+            keyUsages: ["deriveBits", "deriveKey"],
+            metadata: { storage: "bytes", scheme: "pbkdf2-p256", parentKeyId, ...safeParams },
+            version: 1,
+        });
+        return id;
+    };
+    /**
+     * Derives a BIP-32 secp256k1 child from a parent holding BIP39 entropy and
+     * seals the child's private key at birth, so signing never reopens the
+     * entropy. Only the public key is recorded in metadata.
+     */
+    const deriveSecp256k1 = async (parentId, parent, path, opts, ctx) => {
+        assertBip32Path(path);
+        const holdsEntropy = parent.type === "secret-key" ||
+            (parent.type === "seed" && parent.metadata?.scheme === "bip39");
+        if (!holdsEntropy) {
+            throw new InvalidKeyDataError("secp256k1 derivation expects a BIP39 entropy parent");
+        }
+        // The shim derives the seed with no passphrase; deriving from a protected
+        // seed without it would silently mint a different (and wrong) key.
+        if (parent.metadata?.protected === true || parent.metadata?.passphraseSecretId !== undefined) {
+            throw new InvalidKeyDataError("secp256k1 derivation does not support passphrase-protected seeds");
+        }
+        const id = opts.id ?? crypto.randomUUID();
+        return driver.use(parentId, ctx, async (m) => {
+            if (m.kind !== "bytes") {
+                throw new InvalidKeyDataError(`parent ${parentId} does not hold entropy bytes`);
+            }
+            // The shim zeroes the injected entropy once the child exists.
+            const pair = (await subtle.generateKey({ name: SECP256K1_ALGORITHM, entropy: m.bytes, path }, false, ["sign", "verify"]));
+            await consumeKeyMaterial(pair.privateKey, (k) => putBytes(id, Uint8Array.from(k), ctx));
+            const publicKey = consumeKeyMaterial(pair.publicKey, (k) => Uint8Array.from(k));
+            await addMetadata({
+                id,
+                type: "hd-derived-secp256k1",
+                algorithm: SECP256K1_ALGORITHM,
+                extractable: false,
+                keyUsages: ["sign", "verify"],
+                publicKey,
+                metadata: { storage: "bytes", parentKeyId: parentId, path, ...opts.metadata },
+                version: 1,
+            });
+            return id;
+        });
+    };
+    const generateFalcon = async (options, id, ctx) => {
+        return withSeed(options.params, ctx, async (seed) => {
+            const pair = (await subtle.generateKey({ name: "Falcon-1024", seed }, options.extractable, ["sign", "verify"]));
+            await consumeKeyMaterial(pair.privateKey, (m) => putBytes(id, Uint8Array.from(m), ctx));
+            const publicKey = consumeKeyMaterial(pair.publicKey, (m) => Uint8Array.from(m));
+            await addMetadata({
+                id,
+                type: "falcon-1024",
+                algorithm: "Falcon-1024",
+                extractable: options.extractable,
+                keyUsages: options.keyUsages,
+                publicKey,
+                metadata: { storage: "bytes", ...publicParams(options.params) },
+                version: 1,
+            });
+            return id;
+        });
+    };
+    const generateEd25519 = async (options, id, ctx) => {
+        const extractable = options.extractable;
+        // Generated extractable at the host so the public bytes (and, for an
+        // `extractable: true` request, the persisted material) can be captured;
+        // the in-memory extractable pair is discarded after persistence.
+        const pair = (await host.generateKey({ name: "Ed25519" }, true, [
+            "sign",
+            "verify",
+        ]));
+        const publicKey = new Uint8Array(await host.exportKey("raw", pair.publicKey));
+        if (native && !extractable) {
+            // Re-import the private key as NON-extractable for persistence; only the
+            // non-extractable private key is stored.
+            const pkcs8 = new Uint8Array(await host.exportKey("pkcs8", pair.privateKey));
+            const privateKey = await host.importKey("pkcs8", pkcs8, { name: "Ed25519" }, false, ["sign"]);
+            pkcs8.fill(0);
+            await driver.put(id, { kind: "cryptokey", privateKey, publicKey: pair.publicKey }, ctx);
+        }
+        else {
+            // Byte-only backend — or a key requested `extractable: true`, whose
+            // material `export` must be able to hand back: persist the private key
+            // as sealed pkcs8 bytes.
+            const pkcs8 = new Uint8Array(await host.exportKey("pkcs8", pair.privateKey));
+            await putBytes(id, pkcs8, ctx);
+        }
+        await addMetadata({
+            id,
+            type: "ed25519",
+            algorithm: "EdDSA",
+            extractable,
+            keyUsages: options.keyUsages,
+            publicKey,
+            format: native && !extractable ? undefined : "pkcs8",
+            metadata: {
+                storage: native && !extractable ? "cryptokey" : "bytes",
+                signAlgorithm: { name: "Ed25519" },
+                ...publicParams(options.params),
+            },
+            version: 1,
+        });
+        return id;
+    };
+    /**
+     * Imports an existing standalone Ed25519 private key (a 32-byte seed) into
+     * the keystore, persisting it exactly like {@link generateEd25519} does —
+     * the only difference being that the private key material comes from the
+     * caller instead of a freshly generated pair.
+     *
+     * The seed is wrapped into a PKCS#8 document and imported through the host
+     * Subtle as a NON-extractable private key for persistence (native or
+     * byte-only, mirroring {@link generateEd25519}'s branches; a key imported
+     * with `extractable: true` is instead sealed as bytes so `export` can hand
+     * its material back). The actual public key is always re-derived from the
+     * seed (via an EXTRACTABLE re-import + JWK export, reading the base64url `x`
+     * member) so a caller-supplied `publicKey` can be validated against it
+     * rather than blindly trusted.
+     */
+    const importEd25519 = async (keyData, id, ctx) => {
+        const extractable = keyData.extractable === true;
+        const seed = keyData.privateKey;
+        if (!(seed instanceof Uint8Array) || seed.byteLength !== 32) {
+            throw new InvalidKeyDataError("ed25519 import requires a 32-byte Uint8Array privateKey (the Ed25519 seed)");
+        }
+        if (keyData.publicKey !== undefined && keyData.publicKey.byteLength !== 32) {
+            throw new InvalidKeyDataError("ed25519 import requires a 32-byte Uint8Array publicKey when supplied");
+        }
+        const pkcs8 = seedToEd25519Pkcs8(seed);
+        // Derive the actual public key from the seed via an EXTRACTABLE re-import +
+        // JWK export, so a caller-supplied publicKey can be validated against it.
+        const extractableKey = await host.importKey("pkcs8", bs(pkcs8), { name: "Ed25519" }, true, [
+            "sign",
+        ]);
+        const jwk = (await host.exportKey("jwk", extractableKey));
+        if (typeof jwk.x !== "string") {
+            pkcs8.fill(0);
+            throw new InvalidKeyDataError("failed to derive the Ed25519 public key from the supplied privateKey");
+        }
+        const derivedPublicKey = base64UrlToBytes(jwk.x);
+        if (keyData.publicKey && !bytesEqual(keyData.publicKey, derivedPublicKey)) {
+            pkcs8.fill(0);
+            throw new InvalidKeyDataError("supplied publicKey does not match the Ed25519 privateKey");
+        }
+        const publicKey = keyData.publicKey ? Uint8Array.from(keyData.publicKey) : derivedPublicKey;
+        if (native && !extractable) {
+            const privateKey = await host.importKey("pkcs8", bs(pkcs8), { name: "Ed25519" }, false, [
+                "sign",
+            ]);
+            pkcs8.fill(0);
+            const publicCryptoKey = await host.importKey("raw", bs(publicKey), { name: "Ed25519" }, true, ["verify"]);
+            await driver.put(id, { kind: "cryptokey", privateKey, publicKey: publicCryptoKey }, ctx);
+        }
+        else {
+            // Byte-only backend or an extractable key: persist the private key as
+            // sealed pkcs8 bytes.
+            await putBytes(id, pkcs8, ctx);
+        }
+        await addMetadata({
+            id,
+            type: "ed25519",
+            algorithm: "EdDSA",
+            extractable,
+            keyUsages: keyData.keyUsages ?? ["sign", "verify"],
+            publicKey,
+            format: native && !extractable ? undefined : "pkcs8",
+            metadata: {
+                storage: native && !extractable ? "cryptokey" : "bytes",
+                signAlgorithm: { name: "Ed25519" },
+                ...keyData.metadata,
+            },
+            version: 1,
+        });
+        return id;
+    };
+    const generateHostKey = async (options, id, ctx) => {
+        const algorithm = { name: options.algorithm, ...options.params };
+        // The algorithm object handed to `generateKey` may legitimately carry secret
+        // inputs; the one RECORDED for later verification must not (see
+        // `publicParams`).
+        const signAlgorithm = { name: options.algorithm, ...publicParams(options.params) };
+        const nativeResult = native && !options.extractable
+            ? (await subtle.generateKey(algorithm, false, options.keyUsages))
+            : undefined;
+        // A shim may answer with its own CryptoKey-shaped handle rather than a real
+        // host key. Such a handle cannot be persisted natively (structured clone
+        // drops its birth material, or writes plain fields unsealed), so discard it
+        // and fall through to the sealed-bytes path below.
+        if (nativeResult && !isHostKeyResult(nativeResult))
+            discardHandles(nativeResult);
+        else if (nativeResult) {
+            const result = nativeResult;
+            // Public halves are always extractable: mirror the SPKI bytes into the
+            // metadata (like the byte branch below) so a peer can be handed this
+            // key's public key, e.g. as an encryptWithKey recipient.
+            let publicKey;
+            if ("privateKey" in result) {
+                publicKey = new Uint8Array(await subtle.exportKey("spki", result.publicKey));
+                await driver.put(id, { kind: "cryptokey", privateKey: result.privateKey, publicKey: result.publicKey }, ctx);
+            }
+            else {
+                await driver.put(id, { kind: "cryptokey", privateKey: result }, ctx);
+            }
+            await addMetadata({
+                id,
+                type: options.type,
+                algorithm: options.algorithm,
+                extractable: false,
+                keyUsages: options.keyUsages,
+                publicKey,
+                metadata: {
+                    storage: "cryptokey",
+                    signAlgorithm,
+                    spki: publicKey !== undefined,
+                    ...publicParams(options.params),
+                },
+                version: 1,
+            });
+            return id;
+        }
+        // Byte-only backend or an `extractable: true` request: generate
+        // extractable, serialize and seal the private key (pkcs8 for asymmetric,
+        // raw for symmetric), keeping the public bytes.
+        const result = (await subtle.generateKey(algorithm, true, options.keyUsages));
+        let publicKey;
+        let format;
+        if ("privateKey" in result) {
+            publicKey = new Uint8Array(await subtle.exportKey("spki", result.publicKey));
+            const pkcs8 = new Uint8Array(await subtle.exportKey("pkcs8", result.privateKey));
+            await putBytes(id, pkcs8, ctx);
+            format = "pkcs8";
+        }
+        else {
+            const raw = new Uint8Array(await subtle.exportKey("raw", result));
+            await putBytes(id, raw, ctx);
+            format = "raw";
+        }
+        await addMetadata({
+            id,
+            type: options.type,
+            algorithm: options.algorithm,
+            extractable: options.extractable,
+            keyUsages: options.keyUsages,
+            publicKey,
+            format,
+            metadata: {
+                storage: "bytes",
+                signAlgorithm,
+                spki: publicKey !== undefined,
+                ...publicParams(options.params),
+            },
+            version: 1,
+        });
+        return id;
+    };
+    const api = {
+        ready,
+        async generate(options, ctx) {
+            await ready;
+            const id = options.params?.id ?? crypto.randomUUID();
+            setStatus("generating");
+            try {
+                if (options.algorithm === "Falcon-1024")
+                    return await generateFalcon(options, id, ctx);
+                // Fresh mnemonic seeds (BIP39 / Algo25) mint recoverable entropy via the
+                // seed shims. Importing an existing seed goes through `importSeed`.
+                if (options.type === "seed" || options.type === "hd-seed") {
+                    return await generateSeed(options, id, ctx);
+                }
+                if (options.type === "hd-root-key") {
+                    // A `pbkdf2-p256` main key shares the `hd-root-key` type with the XHD
+                    // root; `algorithm: "P256"` (or an explicit scheme) selects it.
+                    if (options.algorithm === "P256" || options.params?.scheme === "pbkdf2-p256") {
+                        return await generateDP256Main(options, id, ctx);
+                    }
+                    return await generateHDRoot(options, id, ctx);
+                }
+                if (options.type === "ed25519")
+                    return await generateEd25519(options, id, ctx);
+                return await generateHostKey(options, id, ctx);
+            }
+            finally {
+                setStatus("idle");
+            }
+        },
+        async importSeed(seed, opts, ctx) {
+            await ready;
+            const id = opts?.id ?? crypto.randomUUID();
+            setStatus("importing");
+            try {
+                await putBytes(id, Uint8Array.from(seed), ctx);
+                await addMetadata({
+                    id,
+                    type: "seed",
+                    algorithm: "raw",
+                    // A seed imported `extractable: true` releases the same bytes back
+                    // through `export` (they are already sealed in the driver either way).
+                    extractable: opts?.extractable === true,
+                    keyUsages: ["deriveBits", "deriveKey"],
+                    metadata: { storage: "bytes", name: opts?.name ?? "Imported Seed", ...opts?.metadata },
+                    version: 1,
+                });
+                return id;
+            }
+            finally {
+                setStatus("idle");
+            }
+        },
+        async deriveFromSeed(seedId, path, opts, ctx) {
+            await ready;
+            setStatus("deriving");
+            try {
+                const parent = await loadMetadata(seedId);
+                if (opts?.curve === "secp256k1") {
+                    return await deriveSecp256k1(seedId, parent, path, opts, ctx);
+                }
+                if (parent.type !== "hd-root-key") {
+                    throw new InvalidKeyDataError("deriveFromSeed expects an hd-root-key parent");
+                }
+                const bip44Path = parsePath(path);
+                const derivationType = opts?.mode === "standard"
+                    ? BIP32DerivationType.Khovratovich
+                    : BIP32DerivationType.Peikert;
+                // Re-derive the child PUBLIC key by injecting the decrypted root; the
+                // shim wipes the injected root once derivation completes.
+                const derived = await driver.use(seedId, ctx, async (m) => {
+                    if (m.kind !== "bytes") {
+                        throw new InvalidKeyDataError(`root ${seedId} does not hold key bytes`);
+                    }
+                    const handle = createKeyHandle("private", { name: "BIP32-Ed25519" }, false, ["sign"]);
+                    return new Uint8Array((await subtle.deriveBits({
+                        name: "BIP32-Ed25519",
+                        bip44Path,
+                        derivationType,
+                        rootKey: m.bytes,
+                    }, handle)));
+                });
+                const publicKey = derived.subarray(0, 32);
+                const id = opts?.id ?? crypto.randomUUID();
+                await addMetadata({
+                    id,
+                    type: "hd-derived-ed25519",
+                    algorithm: "EdDSA",
+                    extractable: false,
+                    keyUsages: ["sign", "verify"],
+                    publicKey,
+                    metadata: {
+                        storage: "none",
+                        parentKeyId: seedId,
+                        path,
+                        bip44Path,
+                        derivationType,
+                        ...opts?.metadata,
+                    },
+                    version: 1,
+                });
+                return id;
+            }
+            finally {
+                setStatus("idle");
+            }
+        },
+        async deriveDomainKey(mainKeyId, opts, ctx) {
+            await ready;
+            setStatus("deriving");
+            try {
+                const parent = await loadMetadata(mainKeyId);
+                if (parent.type !== "hd-root-key" || parent.metadata?.scheme !== "pbkdf2-p256") {
+                    throw new InvalidKeyDataError("deriveDomainKey expects a pbkdf2-p256 hd-root-key parent");
+                }
+                if (typeof opts.origin !== "string" || typeof opts.userHandle !== "string") {
+                    throw new InvalidKeyDataError("deriveDomainKey requires an origin and userHandle");
+                }
+                const origin = opts.origin;
+                const userHandle = opts.userHandle;
+                const counter = opts.counter ?? 0;
+                // Re-derive the child PUBLIC key by injecting the decrypted main key; the
+                // shim wipes the injected main key once derivation completes.
+                const publicKey = await driver.use(mainKeyId, ctx, async (m) => {
+                    if (m.kind !== "bytes") {
+                        throw new InvalidKeyDataError(`main key ${mainKeyId} does not hold key bytes`);
+                    }
+                    const handle = createKeyHandle("private", { name: "Deterministic-P256" }, false, [
+                        "sign",
+                    ]);
+                    return new Uint8Array((await subtle.deriveBits({
+                        name: "Deterministic-P256",
+                        origin,
+                        userHandle,
+                        counter,
+                        mainKey: m.bytes,
+                    }, handle)));
+                });
+                const id = opts.id ?? crypto.randomUUID();
+                await addMetadata({
+                    id,
+                    type: "hd-derived-p256",
+                    algorithm: "P256",
+                    extractable: false,
+                    keyUsages: ["sign", "verify"],
+                    publicKey,
+                    metadata: {
+                        storage: "none",
+                        scheme: "pbkdf2-p256",
+                        parentKeyId: mainKeyId,
+                        origin,
+                        userHandle,
+                        counter,
+                        ...opts.metadata,
+                    },
+                    version: 1,
+                });
+                return id;
+            }
+            finally {
+                setStatus("idle");
+            }
+        },
+        async sign(id, data, _algorithm, ctx) {
+            await ready;
+            const key = await loadMetadata(id);
+            setStatus("signing");
+            try {
+                switch (key.type) {
+                    case "hd-derived-ed25519": {
+                        const parentKeyId = key.metadata?.parentKeyId;
+                        return await driver.use(parentKeyId, ctx, async (m) => {
+                            if (m.kind !== "bytes") {
+                                throw new InvalidKeyDataError(`root ${parentKeyId} does not hold key bytes`);
+                            }
+                            const handle = createKeyHandle("private", { name: "BIP32-Ed25519" }, false, ["sign"]);
+                            const signature = await subtle.sign({
+                                name: "BIP32-Ed25519",
+                                bip44Path: key.metadata?.bip44Path,
+                                derivationType: key.metadata?.derivationType,
+                                rootKey: m.bytes,
+                            }, handle, bs(data));
+                            return new Uint8Array(signature);
+                        });
+                    }
+                    case "falcon-1024": {
+                        return await driver.use(id, ctx, async (m) => {
+                            if (m.kind !== "bytes") {
+                                throw new InvalidKeyDataError(`key ${id} does not hold Falcon bytes`);
+                            }
+                            const handle = createKeyHandle("private", { name: "Falcon-1024" }, false, ["sign"]);
+                            const signature = await subtle.sign({ name: "Falcon-1024", privateKey: m.bytes }, handle, bs(data));
+                            return new Uint8Array(signature);
+                        });
+                    }
+                    case "hd-derived-secp256k1":
+                    case "secp256k1": {
+                        return await driver.use(id, ctx, async (m) => {
+                            if (m.kind !== "bytes") {
+                                throw new InvalidKeyDataError(`key ${id} does not hold secp256k1 bytes`);
+                            }
+                            const handle = createKeyHandle("private", { name: SECP256K1_ALGORITHM }, false, [
+                                "sign",
+                            ]);
+                            const signature = await subtle.sign({
+                                name: SECP256K1_ALGORITHM,
+                                privateKey: m.bytes,
+                            }, handle, bs(data));
+                            return new Uint8Array(signature);
+                        });
+                    }
+                    case "hd-derived-p256": {
+                        const parentKeyId = key.metadata?.parentKeyId;
+                        return await driver.use(parentKeyId, ctx, async (m) => {
+                            if (m.kind !== "bytes") {
+                                throw new InvalidKeyDataError(`main key ${parentKeyId} does not hold key bytes`);
+                            }
+                            const handle = createKeyHandle("private", { name: "Deterministic-P256" }, false, [
+                                "sign",
+                            ]);
+                            const signature = await subtle.sign({
+                                name: "Deterministic-P256",
+                                origin: key.metadata?.origin,
+                                userHandle: key.metadata?.userHandle,
+                                counter: key.metadata?.counter,
+                                mainKey: m.bytes,
+                            }, handle, bs(data));
+                            return new Uint8Array(signature);
+                        });
+                    }
+                    case "hd-root-key":
+                    case "seed":
+                        throw new InvalidKeyDataError(`${key.type} keys cannot sign; derive a child key first`);
+                    default: {
+                        const signAlgorithm = key.metadata?.signAlgorithm ??
+                            { name: key.algorithm };
+                        return await driver.use(id, ctx, async (m) => {
+                            let privateKey;
+                            if (m.kind === "cryptokey") {
+                                privateKey = m.privateKey;
+                            }
+                            else {
+                                // Byte-only backend: re-import the serialized private key.
+                                const format = key.format ?? "pkcs8";
+                                privateKey = await subtle.importKey(format, bs(m.bytes), signAlgorithm, false, [
+                                    "sign",
+                                ]);
+                            }
+                            const signature = await subtle.sign(signAlgorithm, privateKey, bs(data));
+                            return new Uint8Array(signature);
+                        });
+                    }
+                }
+            }
+            finally {
+                setStatus("idle");
+            }
+        },
+        async verify(id, data, signature, _algorithm) {
+            await ready;
+            const key = await loadMetadata(id);
+            setStatus("verifying");
+            try {
+                switch (key.type) {
+                    case "hd-derived-ed25519": {
+                        if (!key.publicKey)
+                            throw new InvalidKeyDataError("missing public key for verify");
+                        const handle = createKeyHandle("public", { name: "BIP32-Ed25519" }, true, ["verify"]);
+                        return await subtle.verify({
+                            name: "BIP32-Ed25519",
+                            bip44Path: key.metadata?.bip44Path,
+                            publicKey: key.publicKey,
+                        }, handle, bs(signature), bs(data));
+                    }
+                    case "falcon-1024": {
+                        if (!key.publicKey)
+                            throw new InvalidKeyDataError("missing public key for verify");
+                        const handle = createKeyHandle("public", { name: "Falcon-1024" }, true, ["verify"]);
+                        return await subtle.verify({ name: "Falcon-1024", publicKey: key.publicKey }, handle, bs(signature), bs(data));
+                    }
+                    case "hd-derived-p256": {
+                        if (!key.publicKey)
+                            throw new InvalidKeyDataError("missing public key for verify");
+                        // The derived passkey is an ordinary P-256 key; the shim verifies it
+                        // via the host's native ECDSA and needs only the (non-secret) public
+                        // key, so no main-key unlock is required.
+                        const handle = createKeyHandle("public", { name: "Deterministic-P256" }, true, [
+                            "verify",
+                        ]);
+                        return await subtle.verify({
+                            name: "Deterministic-P256",
+                            publicKey: key.publicKey,
+                        }, handle, bs(signature), bs(data));
+                    }
+                    case "ed25519": {
+                        if (!key.publicKey)
+                            throw new InvalidKeyDataError("missing public key for verify");
+                        const publicKey = await host.importKey("raw", bs(key.publicKey), { name: "Ed25519" }, true, ["verify"]);
+                        return await host.verify({ name: "Ed25519" }, publicKey, bs(signature), bs(data));
+                    }
+                    default: {
+                        const verifyAlgorithm = key.metadata?.signAlgorithm ??
+                            { name: key.algorithm };
+                        // A public SPKI is recorded in metadata on byte-only backends.
+                        if (key.publicKey && key.metadata?.spki) {
+                            const publicKey = await subtle.importKey("spki", bs(key.publicKey), verifyAlgorithm, true, ["verify"]);
+                            return await subtle.verify(verifyAlgorithm, publicKey, bs(signature), bs(data));
+                        }
+                        // Otherwise the public key rides on the persisted CryptoKey material.
+                        return await driver.use(id, undefined, async (m) => {
+                            if (m.kind !== "cryptokey" || !m.publicKey) {
+                                throw new InvalidKeyDataError("missing public key for verify");
+                            }
+                            return subtle.verify(verifyAlgorithm, m.publicKey, bs(signature), bs(data));
+                        });
+                    }
+                }
+            }
+            finally {
+                setStatus("idle");
+            }
+        },
+        async export(id, _options, ctx) {
+            await ready;
+            const key = await loadMetadata(id);
+            // Only a key created `extractable: true` ever releases private material;
+            // everything else exports its public metadata alone — private material is
+            // owned by the storage layer and never crosses the public surface.
+            if (!key.extractable)
+                return { ...key };
+            setStatus("exporting");
+            try {
+                const privateKey = await driver.use(id, ctx, async (m) => {
+                    if (m.kind !== "bytes") {
+                        throw new InvalidKeyDataError(`key ${id} is marked extractable but holds no exportable bytes`);
+                    }
+                    // Ed25519 material is sealed as its PKCS#8 document; hand back the
+                    // 32-byte seed ({@link Ed25519KeyData.privateKey}'s documented shape),
+                    // so an export round-trips through `import` unchanged. Everything
+                    // else exports as stored (`key.format` records how to read it).
+                    if (key.type === "ed25519" && key.format === "pkcs8") {
+                        return ed25519Pkcs8ToSeed(m.bytes);
+                    }
+                    return Uint8Array.from(m.bytes);
+                });
+                return { ...key, privateKey };
+            }
+            finally {
+                setStatus("idle");
+            }
+        },
+        async remove(id, ctx) {
+            await ready;
+            // A seed's sealed passphrase is worthless without the seed, so it goes
+            // with it rather than lingering as an orphaned secret.
+            const passphraseSecretId = store.state.keys.find((k) => k.id === id)?.metadata
+                ?.passphraseSecretId;
+            await driver.remove(id, ctx);
+            if (typeof passphraseSecretId === "string") {
+                try {
+                    await driver.remove(passphraseSecretId, ctx);
+                }
+                catch {
+                    // Already gone; the metadata below is dropped either way.
+                }
+            }
+            store.setState((s) => ({
+                ...s,
+                keys: s.keys.filter((k) => k.id !== id && k.id !== passphraseSecretId),
+            }));
+        },
+        ...(driver.clear
+            ? {
+                async clear(ctx) {
+                    await ready;
+                    // driver.clear is guaranteed defined in this branch.
+                    await driver.clear?.(ctx);
+                    store.setState((s) => ({ ...s, keys: [] }));
+                },
+            }
+            : {}),
+        async encryptWithKey(id, data, options, ctx) {
+            await ready;
+            const key = await loadMetadata(id);
+            setStatus("encrypting");
+            try {
+                const recipient = options?.recipientPublicKey;
+                if (recipient) {
+                    // Peer path: seal to the recipient with HPKE Auth mode. The static
+                    // ECDH pair is unlocked just-in-time; only the CryptoKey handle
+                    // survives the callback.
+                    const recipientPublicKey = await toRawP256Point(host, recipient);
+                    const sender = await driver.use(id, ctx, (m) => resolveEcdhPair(host, m, key, id));
+                    const { enc, ciphertext } = await hpkeSealAuth(host, {
+                        recipientPublicKey,
+                        senderPrivateKey: sender.privateKey,
+                        senderPublicKey: sender.publicKey,
+                        info: ENCRYPT_PEER_INFO,
+                        aad: new Uint8Array(0),
+                        plaintext: data,
+                    });
+                    // Peer layout: [version(1) | suite(1) | senderPub(65) | enc(65) | ct].
+                    // The sender's public point rides along so the recipient's
+                    // decryptWithKey is self-contained — it both keys the agreement and
+                    // is authenticated by it (a swapped sender fails to open).
+                    const out = new Uint8Array(ENCRYPT_PEER_HEADER_LENGTH + ciphertext.byteLength);
+                    out[0] = ENCRYPT_VERSION_PEER;
+                    out[1] = ENCRYPT_PEER_SUITE;
+                    out.set(sender.publicKey, 2);
+                    out.set(enc, 2 + HPKE_P256_POINT_LENGTH);
+                    out.set(ciphertext, ENCRYPT_PEER_HEADER_LENGTH);
+                    return out;
+                }
+                // Self path: unlock the material just-in-time and resolve the AES key
+                // from it — HKDF over private bytes, or the native host key/agreement
+                // when the driver holds a CryptoKey. The AES handle survives the
+                // callback; raw bytes never do.
+                const aes = await driver.use(id, ctx, (m) => aesKeyFromMaterial(host, m, key.publicKey, id));
+                const iv = crypto.getRandomValues(new Uint8Array(12));
+                const ciphertext = new Uint8Array(await host.encrypt({ name: "AES-GCM", iv: bs(iv) }, aes, bs(data)));
+                // Self layout: [version(1) | iv(12) | ciphertext].
+                const out = new Uint8Array(1 + iv.byteLength + ciphertext.byteLength);
+                out[0] = ENCRYPT_VERSION;
+                out.set(iv, 1);
+                out.set(ciphertext, 1 + iv.byteLength);
+                return out;
+            }
+            finally {
+                setStatus("idle");
+            }
+        },
+        async decryptWithKey(id, data, _options, ctx) {
+            await ready;
+            const key = await loadMetadata(id);
+            setStatus("decrypting");
+            try {
+                const version = data[0];
+                if (version === ENCRYPT_VERSION_PEER) {
+                    // Peer path: open an HPKE Auth-mode seal addressed to this key. The
+                    // sender's public point comes from the frame and is authenticated by
+                    // the agreement itself.
+                    if (data[1] !== ENCRYPT_PEER_SUITE) {
+                        throw new InvalidKeyFormatError(`unsupported peer-encryption suite: ${String(data[1])}`);
+                    }
+                    if (data.byteLength <= ENCRYPT_PEER_HEADER_LENGTH) {
+                        throw new InvalidKeyFormatError("truncated peer-encrypted ciphertext");
+                    }
+                    const senderPublicKey = data.subarray(2, 2 + HPKE_P256_POINT_LENGTH);
+                    const enc = data.subarray(2 + HPKE_P256_POINT_LENGTH, ENCRYPT_PEER_HEADER_LENGTH);
+                    const ciphertext = data.subarray(ENCRYPT_PEER_HEADER_LENGTH);
+                    const recipient = await driver.use(id, ctx, (m) => resolveEcdhPair(host, m, key, id));
+                    return await hpkeOpenAuth(host, {
+                        enc,
+                        recipientPrivateKey: recipient.privateKey,
+                        recipientPublicKey: recipient.publicKey,
+                        senderPublicKey,
+                        info: ENCRYPT_PEER_INFO,
+                        aad: new Uint8Array(0),
+                        ciphertext,
+                    });
+                }
+                if (version !== ENCRYPT_VERSION) {
+                    throw new InvalidKeyFormatError(`unsupported ciphertext version: ${String(version)}`);
+                }
+                const iv = data.subarray(1, 13);
+                const ciphertext = data.subarray(13);
+                const aes = await driver.use(id, ctx, (m) => aesKeyFromMaterial(host, m, key.publicKey, id));
+                return new Uint8Array(await host.decrypt({ name: "AES-GCM", iv: bs(iv) }, aes, bs(ciphertext)));
+            }
+            finally {
+                setStatus("idle");
+            }
+        },
+        async deriveSharedSecret(id, publicKey, meFirst, _algorithm, ctx) {
+            await ready;
+            const key = await loadMetadata(id);
+            setStatus("deriving");
+            try {
+                if (key.type === "hd-derived-ed25519") {
+                    // XHD Diffie-Hellman: unlock the root just-in-time and let the shim
+                    // run ECDH along the recorded path against the remote public key.
+                    const parentKeyId = key.metadata?.parentKeyId;
+                    return await driver.use(parentKeyId, ctx, async (m) => {
+                        if (m.kind !== "bytes") {
+                            throw new InvalidKeyDataError(`root ${parentKeyId} does not hold key bytes`);
+                        }
+                        const handle = createKeyHandle("private", { name: "BIP32-Ed25519" }, false, [
+                            "deriveBits",
+                        ]);
+                        const secret = await subtle.deriveBits({
+                            name: "BIP32-Ed25519",
+                            bip44Path: key.metadata?.bip44Path,
+                            derivationType: key.metadata?.derivationType,
+                            rootKey: m.bytes,
+                            otherPartyPub: publicKey,
+                            meFirst,
+                        }, handle);
+                        return new Uint8Array(secret);
+                    });
+                }
+                // Standard EC key: perform host-native ECDH. The stored private key is
+                // re-imported for ECDH usage just-in-time.
+                const namedCurve = key.metadata?.namedCurve ?? "P-256";
+                const remote = await host.importKey("raw", bs(publicKey), { name: "ECDH", namedCurve }, false, []);
+                return await driver.use(id, ctx, async (m) => {
+                    let privateKey;
+                    if (m.kind === "cryptokey") {
+                        privateKey = m.privateKey;
+                    }
+                    else {
+                        const format = key.format ?? "pkcs8";
+                        privateKey = await host.importKey(format, bs(m.bytes), { name: "ECDH", namedCurve }, false, ["deriveBits"]);
+                    }
+                    const secret = await host.deriveBits({ name: "ECDH", public: remote }, privateKey, 256);
+                    return new Uint8Array(secret);
+                });
+            }
+            finally {
+                setStatus("idle");
+            }
+        },
+        async import(data, _format, ctx) {
+            await ready;
+            if (data instanceof Uint8Array || typeof data === "string") {
+                throw new InvalidKeyFormatError("importing raw/encoded bytes is not supported; use KeyData");
+            }
+            const keyData = data;
+            const id = keyData.id ?? crypto.randomUUID();
+            setStatus("importing");
+            try {
+                // `hd-seed` is the deprecated spelling of `seed`, still part of
+                // `KeyType` and still promised to keep working. Normalise it on the way
+                // in exactly as `generate` does, so records converge on the current
+                // name and an older caller does not hit `import of type hd-seed is not
+                // supported`.
+                const type = keyData.type === "hd-seed" ? "seed" : keyData.type;
+                if (type === "seed" || type === "hd-root-key") {
+                    if (!(keyData.privateKey instanceof Uint8Array)) {
+                        throw new InvalidKeyDataError(`${type} import requires Uint8Array privateKey`);
+                    }
+                    await putBytes(id, Uint8Array.from(keyData.privateKey), ctx);
+                    await addMetadata({
+                        id,
+                        type,
+                        algorithm: "raw",
+                        // Honour the caller's `extractable` flag (default false): a record
+                        // imported `extractable: true` releases the same bytes back through
+                        // `export` (they are already sealed in the driver either way).
+                        extractable: keyData.extractable === true,
+                        keyUsages: keyData.keyUsages ?? ["deriveBits", "deriveKey"],
+                        metadata: { storage: "bytes", ...keyData.metadata },
+                        version: 1,
+                    });
+                    return id;
+                }
+                if (keyData.type === "secp256k1") {
+                    if (!(keyData.privateKey instanceof Uint8Array)) {
+                        throw new InvalidKeyDataError("secp256k1 import requires Uint8Array privateKey");
+                    }
+                    // The shim validates the scalar and zeroes the copy it is handed.
+                    const handle = createKeyHandle("private", { name: SECP256K1_ALGORITHM }, false, ["sign"]);
+                    const publicKey = new Uint8Array(await subtle.deriveBits({
+                        name: SECP256K1_ALGORITHM,
+                        privateKey: Uint8Array.from(keyData.privateKey),
+                    }, handle));
+                    await putBytes(id, Uint8Array.from(keyData.privateKey), ctx);
+                    await addMetadata({
+                        id,
+                        type: "secp256k1",
+                        algorithm: SECP256K1_ALGORITHM,
+                        // Released through export only when imported extractable.
+                        extractable: keyData.extractable === true,
+                        keyUsages: ["sign", "verify"],
+                        publicKey,
+                        metadata: { storage: "bytes", ...keyData.metadata },
+                        version: 1,
+                    });
+                    return id;
+                }
+                if (keyData.type === "ed25519")
+                    return await importEd25519(keyData, id, ctx);
+                throw new InvalidKeyDataError(`import of type ${keyData.type} is not supported`);
+            }
+            finally {
+                setStatus("idle");
+            }
+        },
+        async batchSign(ids, data, ctx) {
+            const signatures = [];
+            for (let i = 0; i < ids.length; i += 1) {
+                signatures.push(await this.sign(ids[i], data[i], undefined, ctx));
+            }
+            return signatures;
+        },
+        // A general-purpose store for arbitrary secrets (no crypto role). Unlike key
+        // material, a secret's value is readable back in plaintext via `get`; only
+        // its non-secret metadata is mirrored into the reactive store.
+        secrets: {
+            async put(value, opts, ctx) {
+                await ready;
+                const id = opts?.id ?? crypto.randomUUID();
+                const bytes = typeof value === "string" ? new TextEncoder().encode(value) : Uint8Array.from(value);
+                setStatus("storing");
+                try {
+                    await putBytes(id, bytes, ctx);
+                    await addMetadata({
+                        id,
+                        type: "secret-key",
+                        algorithm: "raw",
+                        extractable: false,
+                        keyUsages: [],
+                        metadata: { storage: "bytes", name: opts?.name ?? "Secret", ...opts?.metadata },
+                        version: 1,
+                    });
+                    return id;
+                }
+                finally {
+                    setStatus("idle");
+                }
+            },
+            async get(id, ctx) {
+                await ready;
+                const key = await loadMetadata(id);
+                if (key.type !== "secret-key") {
+                    throw new InvalidKeyDataError(`key ${id} is not a secret`);
+                }
+                return driver.use(id, ctx, (m) => {
+                    if (m.kind !== "bytes") {
+                        throw new InvalidKeyDataError(`secret ${id} does not hold bytes`);
+                    }
+                    return Uint8Array.from(m.bytes);
+                });
+            },
+            async list() {
+                await ready;
+                return store.state.keys.filter((k) => k.type === "secret-key");
+            },
+            async remove(id, ctx) {
+                await ready;
+                await driver.remove(id, ctx);
+                store.setState((s) => ({ ...s, keys: s.keys.filter((k) => k.id !== id) }));
+            },
+        },
+    };
+    // No hooks requested: return the bare orchestrator.
+    if (!options.hooks)
+        return api;
+    // Hooks were bound at creation. Wrap each material-touching method so
+    // `before`/`after`/`error` hooks can intercept it, and expose the collection
+    // as `keystore.hooks`. Inner calls (e.g. `batchSign` → `sign`) run against the
+    // unwrapped `api`, so a batch fires only the `batchSign` hook, not one `sign`
+    // hook per item.
+    const hooks = options.hooks;
+    const run = hooks;
+    const intercept = (name, method) => method === undefined
+        ? undefined
+        : (...args) => run(name, () => method.apply(api, args), { args });
+    const wrapped = { ...api, hooks };
+    wrapped.generate = intercept("generate", api.generate.bind(api));
+    wrapped.import = intercept("import", api.import.bind(api));
+    wrapped.export = intercept("export", api.export.bind(api));
+    wrapped.remove = intercept("remove", api.remove.bind(api));
+    wrapped.sign = intercept("sign", api.sign.bind(api));
+    wrapped.verify = intercept("verify", api.verify.bind(api));
+    wrapped.encryptWithKey = intercept("encryptWithKey", api.encryptWithKey?.bind(api));
+    wrapped.decryptWithKey = intercept("decryptWithKey", api.decryptWithKey?.bind(api));
+    wrapped.deriveSharedSecret = intercept("deriveSharedSecret", api.deriveSharedSecret?.bind(api));
+    wrapped.importSeed = intercept("importSeed", api.importSeed?.bind(api));
+    wrapped.deriveFromSeed = intercept("deriveFromSeed", api.deriveFromSeed?.bind(api));
+    wrapped.deriveDomainKey = intercept("deriveDomainKey", api.deriveDomainKey?.bind(api));
+    wrapped.batchSign = intercept("batchSign", api.batchSign?.bind(api));
+    if (api.clear)
+        wrapped.clear = intercept("clear", api.clear.bind(api));
+    return wrapped;
+}

@@ -37,14 +37,9 @@
     "release:dry-run": "package-releaser --dry-run"
   },
   "dependencies": {
-    "@algorandfoundation/wallet-provider": "catalog:"
-  },
-  "devDependencies": {
-    "@algorandfoundation/package-releaser": "workspace:^",
-    "before-after-hook": "catalog:",
-    "vitest": "catalog:"
+    "@algorandfoundation/wallet-provider": "^1.0.0-canary.5"
   },
   "peerDependencies": {
-    "before-after-hook": "catalog:"
+    "before-after-hook": "^4.0.0"
   }
 }

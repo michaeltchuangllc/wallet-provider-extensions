@@ -1,0 +1,114 @@
+/**
+ * The React Native Keychain/MMKV {@link KeyStoreDriver}: the mobile "material
+ * custodian" for the shared {@link createKeyStore} orchestrator.
+ *
+ * Unlike IndexedDB, MMKV is a string/number/bytes key-value store — it cannot
+ * hold a live {@link CryptoKey}, so this driver's
+ * {@link DriverCapabilities.nativeCryptoKey} is `false` and every secret is
+ * serialized to bytes, sealed with a Keychain-backed AES-256-GCM master key and
+ * persisted encrypted at rest. Because unlocking the master key can require an
+ * interactive biometric/passcode prompt, {@link DriverCapabilities.interactiveUnlock}
+ * is `true` and the per-operation context is {@link AuthenticationOptions}, which
+ * is threaded straight into the master-key read.
+ *
+ * The driver is intentionally free of any hard dependency on the native
+ * libraries: the MMKV-style store and the encrypt-at-rest primitives are
+ * injected as {@link KeychainDriverDeps}. `createReactNativeKeyStore` supplies
+ * the concrete `react-native-mmkv` / `react-native-keychain` /
+ * `react-native-quick-crypto` bindings; tests can inject in-memory fakes.
+ */
+import type { Key, KeyStoreDriver } from "@algorandfoundation/keystore-core";
+import type { AuthenticationOptions } from "../types.ts";
+/** Storage-key prefix for sealed material records (`m/<id>`). */
+export declare const MATERIAL_PREFIX = "m/";
+/** Storage-key prefix for plaintext metadata records (`k/<id>`). */
+export declare const METADATA_PREFIX = "k/";
+/**
+ * The minimal MMKV-style synchronous key/value surface the driver relies on.
+ * Mirrors `react-native-mmkv`'s `MMKV` so the real instance satisfies it
+ * directly, while tests can supply a `Map`-backed fake.
+ */
+export interface KeychainStorage {
+    /** Reads a stored string, or `undefined` when absent. */
+    getString(key: string): string | undefined;
+    /** Writes a string value. */
+    set(key: string, value: string): void;
+    /** Removes a value. */
+    remove(key: string): void;
+    /** Lists every stored key (used to enumerate metadata). */
+    getAllKeys(): string[];
+}
+/**
+ * The encrypt-at-rest primitives the driver needs, decoupled from the native
+ * libraries. `createReactNativeKeyStore` wires these to the Keychain-backed
+ * master key + `react-native-quick-crypto` AES-256-GCM helpers.
+ */
+export interface KeychainCrypto {
+    /**
+     * Resolves the master key for a **write**, creating one on first use when the
+     * store is still empty. May prompt when biometrics are requested.
+     */
+    masterKeyForWrite(options?: AuthenticationOptions): Promise<Uint8Array>;
+    /**
+     * Resolves the existing master key for a **read**. May trigger an interactive
+     * unlock; throws if the key is missing or unlock fails/cancels.
+     */
+    masterKeyForRead(options?: AuthenticationOptions): Promise<Uint8Array>;
+    /** Seals `data` with `key`, returning an opaque string payload. */
+    seal(key: Uint8Array, data: string): Promise<string>;
+    /** Opens a payload produced by {@link KeychainCrypto.seal}. */
+    open(key: Uint8Array, payload: string): Promise<string>;
+    /** Best-effort zeroing of a key buffer once an operation completes. */
+    wipe(key: Uint8Array): void;
+}
+/** Dependencies for {@link createKeychainDriver}. */
+export interface KeychainDriverDeps {
+    /** The MMKV-style store holding sealed material + serialized metadata. */
+    storage: KeychainStorage;
+    /** The Keychain-backed encrypt-at-rest primitives. */
+    crypto: KeychainCrypto;
+}
+/** Serializes {@link Key} metadata to a string, base64-encoding any bytes. */
+export declare function serializeKey(key: Key): string;
+/**
+ * Creates a byte-only {@link KeyStoreDriver} backed by an injected MMKV-style
+ * store and Keychain-backed AES-256-GCM sealing.
+ *
+ * Every secret is serialized, sealed with the master key and stored encrypted
+ * at rest; decrypted bytes live only inside the {@link KeyStoreDriver.use}
+ * callback and are wiped once it settles. The per-operation
+ * {@link AuthenticationOptions} context is forwarded to the master-key read so a
+ * biometric prompt is raised exactly when a secret is actually needed.
+ *
+ * @param deps - {@link KeychainDriverDeps}.
+ * @returns A {@link KeyStoreDriver} to hand to {@link createKeyStore}.
+ */
+export declare function createKeychainDriver(deps: KeychainDriverDeps): KeyStoreDriver<AuthenticationOptions>;
+/**
+ * Marker written to a migrated record's `metadata.migration` field. A UI can
+ * surface these so the user can delete the stale passkey and recreate it under
+ * the new deterministic-P256 (PBKDF2 main key) scheme.
+ */
+export declare const PASSKEY_MIGRATION_NEEDED = "needs-migration";
+/**
+ * Flags **legacy passkeys** in place, non-destructively, on startup.
+ *
+ * Passkeys created before the deterministic-P256 split were derived directly
+ * from the XHD BIP32-Ed25519 root; they carry `type: "hd-derived-p256"` but
+ * **not** `metadata.scheme === "pbkdf2-p256"`. Those keys are not reproducible
+ * under the new scheme (whose passkeys derive from a separate PBKDF2 *main
+ * key*), so rather than silently breaking them this marks each affected record
+ * **in place** with `metadata.migration = "needs-migration"`, preserving its id
+ * and the domain descriptor (`origin`/`userHandle`/`counter`) so the app can
+ * prompt the user to delete the stale passkey and recreate it under the new
+ * scheme.
+ *
+ * The record is updated in place (no copy is created), so the user acts on the
+ * very same passkey instance. The scan is metadata-only (`k/` bucket) — no
+ * material is decrypted and no biometric prompt is raised — and it is
+ * idempotent: a record already flagged `needs-migration` is skipped.
+ *
+ * @param storage - The MMKV-style store holding this keystore's metadata.
+ * @returns The records that were flagged (may be empty).
+ */
+export declare function migrateLegacyPasskeys(storage: KeychainStorage): Key[];

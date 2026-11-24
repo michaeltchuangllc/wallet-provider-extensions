@@ -30,6 +30,7 @@ import {
 import type { Store } from "@tanstack/store";
 import type { HookCollection } from "before-after-hook";
 
+import { Alert } from "react-native";
 import { MasterKeyNotFoundError } from "./errors.ts";
 import { loadDefaultFalconBinding } from "./falcon.ts";
 import { resolveAuthenticationPrompt } from "./prompts.ts";
@@ -56,9 +57,11 @@ export interface ReactNativeKeyStoreOptions {
    * algorithms the keystore needs (e.g. `(host) => withSubtleXHD(host, xhd)`,
    * `(host) => withSubtleFalcon1024(host, falcon)`,
    * `(host) => withSubtleDP256(host, dp256)`). Injected this way, the engine
-   * stays free of a hard dependency on any specific primitive binding.
+   * stays free of a hard dependency on any specific primitive binding. A
+   * function is resolved lazily, as `createKeyStore` does, so a binding that
+   * loads asynchronously (the native Falcon module) can be folded in.
    */
-  shims?: SubtleShim[];
+  shims?: SubtleShim[] | (() => SubtleShim[] | Promise<SubtleShim[]>);
   /**
    * Falcon-1024 binding used to enable post-quantum keys in the **default** shim
    * set (i.e. when `shims` is not supplied). React Native cannot load the WASM
@@ -208,6 +211,8 @@ function withOperationTags(
         prompt: resolveAuthenticationPrompt(callerCtx, defaults, { operation, keyId, key }),
       } satisfies AuthenticationOptions;
 
+      // TEMP: proves the linked clone's sign API ran; remove after testing.
+      if (operation === "sign") Alert.alert("Mithilesh");
       return method.apply(thisArg, next);
     };
   };
@@ -324,7 +329,7 @@ export function createReactNativeKeyStore(
   // folded in as the Falcon-1024 provider (React Native cannot use the WASM
   // `falcon-1024` the other platforms default to). All other default shims
   // (XHD, dp256, BIP39, Algo25) come from core unchanged.
-  const shims: SubtleShim[] | (() => Promise<SubtleShim[]>) =
+  const shims: SubtleShim[] | (() => SubtleShim[] | Promise<SubtleShim[]>) =
     options.shims ??
     (async () => {
       const falcon = options.falcon ?? (await loadDefaultFalconBinding());

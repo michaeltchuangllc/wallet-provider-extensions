@@ -1,0 +1,9 @@
+{
+  "platforms": ["android"],
+  "android": {
+    "modules": [
+      "com.algorandfoundation.seedvault.ReactNativeSeedVaultModule",
+      "com.algorandfoundation.seedvault.ReactNativeSolanaSeedVaultModule"
+    ]
+  }
+}

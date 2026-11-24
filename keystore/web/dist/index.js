@@ -1,0 +1,27 @@
+/**
+ * @module default
+ * @packageDocumentation
+ *
+ * `@algorandfoundation/keystore-web` is the browser entry point for the
+ * keystore. The shared cryptographic implementation (the composable Subtle
+ * shims and the platform-neutral {@link createKeyStore} engine) lives in
+ * `@algorandfoundation/keystore-core`, relies exclusively on the universal
+ * `globalThis.crypto` (`crypto.subtle` / `crypto.getRandomValues`) and pure-JS
+ * primitives, so it runs unchanged in the browser and is re-exported here.
+ *
+ * @remarks
+ * This package also ships {@link createWebKeyStore}: a browser-native
+ * persistence adapter (the `withIndexDB` storage engine) that implements the
+ * {@link KeyStoreAPI} on top of the core composable Subtle shims. Standard host
+ * keys are persisted as non-extractable `CryptoKey`s (structured-cloned into
+ * IndexedDB, so their bytes never live in JS — unless a `masterKey` provider
+ * is supplied, which seals them as bytes too); shim key material (BIP32-Ed25519
+ * roots, Falcon private keys) and raw seeds are stored encrypted at rest with a
+ * non-extractable AES-GCM master key. The reactive store holds only metadata.
+ */
+export * from "@algorandfoundation/keystore-core";
+export { createWebKeyStore } from "./engine.js";
+export { WithKeyStore } from "./extension.js";
+export { KeyStoreDatabase, MATERIAL_STORE, METADATA_STORE, openDatabase, } from "./storage/db.js";
+export { createIndexedDBDriver } from "./storage/driver.js";
+export { getMasterKey, MASTER_KEY_ID, open, seal } from "./storage/vault.js";

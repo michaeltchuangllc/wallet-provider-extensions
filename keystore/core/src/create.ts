@@ -227,6 +227,26 @@ function parsePath(path: string): number[] {
     });
 }
 
+/** Algorithm a secp256k1 shim registers; the engine routes derive, import and sign to it. */
+const SECP256K1_ALGORITHM = "ECDSA-secp256k1";
+
+/**
+ * Strict BIP-32 path check (`m/…`, `'` for hardened, indices below 2^31), run
+ * before a parent's entropy is opened so a malformed path never decrypts it.
+ */
+function assertBip32Path(path: string): void {
+  const [root, ...segments] = path.split("/");
+  const valid =
+    root === "m" &&
+    segments.every((part) => {
+      const match = /^(\d+)'?$/.exec(part);
+      return match !== null && Number(match[1]) < 0x80_00_00_00;
+    });
+  if (!valid) {
+    throw new InvalidKeyFormatError(`invalid BIP-32 path: ${path}`);
+  }
+}
+
 /**
  * Suffix of the secret-store id holding a mnemonic seed's sealed passphrase
  * (the BIP39 "25th word"), used when a seed is generated with
@@ -838,6 +858,59 @@ export function createKeyStore<Ctx = unknown>(options: CreateKeyStoreOptions<Ctx
     return id;
   };
 
+  /**
+   * Derives a BIP-32 secp256k1 child from a parent holding BIP39 entropy and
+   * seals the child's private key at birth, so signing never reopens the
+   * entropy. Only the public key is recorded in metadata.
+   */
+  const deriveSecp256k1 = async (
+    parentId: KeyId,
+    parent: Key,
+    path: string,
+    opts: DeriveOptions,
+    ctx?: Ctx,
+  ): Promise<KeyId> => {
+    assertBip32Path(path);
+    const holdsEntropy =
+      parent.type === "secret-key" ||
+      (parent.type === "seed" && parent.metadata?.scheme === "bip39");
+    if (!holdsEntropy) {
+      throw new InvalidKeyDataError("secp256k1 derivation expects a BIP39 entropy parent");
+    }
+    // The shim derives the seed with no passphrase; deriving from a protected
+    // seed without it would silently mint a different (and wrong) key.
+    if (parent.metadata?.protected === true || parent.metadata?.passphraseSecretId !== undefined) {
+      throw new InvalidKeyDataError(
+        "secp256k1 derivation does not support passphrase-protected seeds",
+      );
+    }
+    const id = opts.id ?? crypto.randomUUID();
+    return driver.use(parentId, ctx, async (m) => {
+      if (m.kind !== "bytes") {
+        throw new InvalidKeyDataError(`parent ${parentId} does not hold entropy bytes`);
+      }
+      // The shim zeroes the injected entropy once the child exists.
+      const pair = (await subtle.generateKey(
+        { name: SECP256K1_ALGORITHM, entropy: m.bytes, path } as unknown as AlgorithmIdentifier,
+        false,
+        ["sign", "verify"],
+      )) as CryptoKeyPair;
+      await consumeKeyMaterial(pair.privateKey, (k) => putBytes(id, Uint8Array.from(k), ctx));
+      const publicKey = consumeKeyMaterial(pair.publicKey, (k) => Uint8Array.from(k));
+      await addMetadata({
+        id,
+        type: "hd-derived-secp256k1",
+        algorithm: SECP256K1_ALGORITHM,
+        extractable: false,
+        keyUsages: ["sign", "verify"],
+        publicKey,
+        metadata: { storage: "bytes", parentKeyId: parentId, path, ...opts.metadata },
+        version: 1,
+      });
+      return id;
+    });
+  };
+
   const generateFalcon = async (options: GenerateOptions, id: KeyId, ctx?: Ctx): Promise<KeyId> => {
     return withSeed(options.params, ctx, async (seed) => {
       const pair = (await subtle.generateKey(
@@ -1146,6 +1219,9 @@ export function createKeyStore<Ctx = unknown>(options: CreateKeyStoreOptions<Ctx
       setStatus("deriving");
       try {
         const parent = await loadMetadata(seedId);
+        if (opts?.curve === "secp256k1") {
+          return await deriveSecp256k1(seedId, parent, path, opts, ctx);
+        }
         if (parent.type !== "hd-root-key") {
           throw new InvalidKeyDataError("deriveFromSeed expects an hd-root-key parent");
         }
@@ -1297,6 +1373,26 @@ export function createKeyStore<Ctx = unknown>(options: CreateKeyStoreOptions<Ctx
               const handle = createKeyHandle("private", { name: "Falcon-1024" }, false, ["sign"]);
               const signature = await subtle.sign(
                 { name: "Falcon-1024", privateKey: m.bytes } as unknown as AlgorithmIdentifier,
+                handle,
+                bs(data),
+              );
+              return new Uint8Array(signature);
+            });
+          }
+          case "hd-derived-secp256k1":
+          case "secp256k1": {
+            return await driver.use(id, ctx, async (m) => {
+              if (m.kind !== "bytes") {
+                throw new InvalidKeyDataError(`key ${id} does not hold secp256k1 bytes`);
+              }
+              const handle = createKeyHandle("private", { name: SECP256K1_ALGORITHM }, false, [
+                "sign",
+              ]);
+              const signature = await subtle.sign(
+                {
+                  name: SECP256K1_ALGORITHM,
+                  privateKey: m.bytes,
+                } as unknown as AlgorithmIdentifier,
                 handle,
                 bs(data),
               );
@@ -1723,6 +1819,35 @@ export function createKeyStore<Ctx = unknown>(options: CreateKeyStoreOptions<Ctx
             // `export` (they are already sealed in the driver either way).
             extractable: keyData.extractable === true,
             keyUsages: keyData.keyUsages ?? ["deriveBits", "deriveKey"],
+            metadata: { storage: "bytes", ...keyData.metadata },
+            version: 1,
+          });
+          return id;
+        }
+        if (keyData.type === "secp256k1") {
+          if (!(keyData.privateKey instanceof Uint8Array)) {
+            throw new InvalidKeyDataError("secp256k1 import requires Uint8Array privateKey");
+          }
+          // The shim validates the scalar and zeroes the copy it is handed.
+          const handle = createKeyHandle("private", { name: SECP256K1_ALGORITHM }, false, ["sign"]);
+          const publicKey = new Uint8Array(
+            await subtle.deriveBits(
+              {
+                name: SECP256K1_ALGORITHM,
+                privateKey: Uint8Array.from(keyData.privateKey),
+              } as unknown as AlgorithmIdentifier,
+              handle,
+            ),
+          );
+          await putBytes(id, Uint8Array.from(keyData.privateKey), ctx);
+          await addMetadata({
+            id,
+            type: "secp256k1",
+            algorithm: SECP256K1_ALGORITHM,
+            // Released through export only when imported extractable.
+            extractable: keyData.extractable === true,
+            keyUsages: ["sign", "verify"],
+            publicKey,
             metadata: { storage: "bytes", ...keyData.metadata },
             version: 1,
           });

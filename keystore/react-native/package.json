@@ -34,33 +34,24 @@
     "release:dry-run": "package-releaser --dry-run"
   },
   "dependencies": {
-    "@algorandfoundation/dp256": "catalog:",
-    "@algorandfoundation/keystore-core": "workspace:*",
-    "@algorandfoundation/wallet-provider": "catalog:",
-    "@algorandfoundation/xhd-wallet-api": "catalog:",
-    "@scure/base": "catalog:",
-    "@scure/bip39": "catalog:",
-    "@tanstack/store": "catalog:",
-    "before-after-hook": "catalog:",
+    "@algorandfoundation/dp256": "^1.1.0",
+    "@algorandfoundation/keystore-core": ">=1.0.0-canary.5",
+    "@algorandfoundation/wallet-provider": "^1.0.0-canary.5",
+    "@algorandfoundation/xhd-wallet-api": "^2.0.0-canary.1",
+    "@scure/base": "^2.0.0",
+    "@scure/bip39": "^1.5.0",
+    "@tanstack/store": "^0.11.2",
+    "before-after-hook": "^4.0.0",
     "react-native-keychain": "^10.0.0",
-    "react-native-mmkv": "catalog:",
-    "react-native-quick-crypto": "catalog:"
-  },
-  "devDependencies": {
-    "@algorandfoundation/package-releaser": "workspace:^",
-    "@algorandfoundation/provider-migrations": "workspace:*",
-    "falcon-1024": "catalog:",
-    "react-native": "catalog:",
-    "typedoc": "catalog:",
-    "typescript": "catalog:",
-    "vitest": "catalog:"
+    "react-native-mmkv": "4.1.2",
+    "react-native-quick-crypto": "^1.0.13"
   },
   "peerDependencies": {
-    "@algorandfoundation/log-store": "workspace:*",
-    "@algorandfoundation/provider-migrations": "workspace:*",
+    "@algorandfoundation/log-store": "*",
+    "@algorandfoundation/provider-migrations": "*",
     "@joe-p/react-native-falcon": "^0.1.0",
-    "@tanstack/store": "catalog:",
-    "before-after-hook": "catalog:"
+    "@tanstack/store": "^0.11.2",
+    "before-after-hook": "^4.0.0"
   },
   "peerDependenciesMeta": {
     "@algorandfoundation/log-store": {

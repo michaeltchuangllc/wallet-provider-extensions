@@ -46,27 +46,16 @@
     "release:dry-run": "package-releaser --dry-run"
   },
   "dependencies": {
-    "@noble/hashes": "catalog:",
-    "@scure/bip39": "catalog:"
-  },
-  "devDependencies": {
-    "@algorandfoundation/dp256": "catalog:",
-    "@algorandfoundation/package-releaser": "workspace:^",
-    "@algorandfoundation/wallet-provider": "catalog:",
-    "@algorandfoundation/xhd-wallet-api": "catalog:",
-    "@tanstack/store": "catalog:",
-    "before-after-hook": "catalog:",
-    "falcon-1024": "catalog:",
-    "typedoc": "catalog:",
-    "vitest": "catalog:"
+    "@noble/hashes": "^2.0.1",
+    "@scure/bip39": "^1.5.0"
   },
   "peerDependencies": {
-    "@algorandfoundation/dp256": "catalog:",
-    "@algorandfoundation/wallet-provider": "catalog:",
-    "@algorandfoundation/xhd-wallet-api": "catalog:",
-    "@tanstack/store": "catalog:",
-    "before-after-hook": "catalog:",
-    "falcon-1024": "catalog:"
+    "@algorandfoundation/dp256": "^1.1.0",
+    "@algorandfoundation/wallet-provider": "^1.0.0-canary.5",
+    "@algorandfoundation/xhd-wallet-api": "^2.0.0-canary.1",
+    "@tanstack/store": "^0.11.2",
+    "before-after-hook": "^4.0.0",
+    "falcon-1024": "^0.2.0"
   },
   "peerDependenciesMeta": {
     "@algorandfoundation/dp256": {

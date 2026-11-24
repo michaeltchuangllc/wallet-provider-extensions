@@ -1,0 +1,43 @@
+{
+  "name": "@algorandfoundation/react-native-seed-vault",
+  "version": "0.0.0",
+  "description": "Expo native module exposing the Algorand Seed Vault Service client from seed-vault-sdk, and the Solana Mobile Seed Vault, to React Native (Android only).",
+  "license": "Apache-2.0",
+  "author": "Algorand Foundation",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/algorandfoundation/wallet-provider-extensions.git",
+    "directory": "seed-vault/react-native"
+  },
+  "files": [
+    "dist",
+    "android",
+    "expo-module.config.json"
+  ],
+  "type": "module",
+  "sideEffects": false,
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "clean": "rm -rf dist node_modules",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@scure/base": "^2.0.0"
+  },
+  "devDependencies": {
+    "expo-modules-core": "58.0.24",
+    "typescript": "^5.6.0",
+    "vitest": "^4.1.2"
+  },
+  "peerDependencies": {
+    "expo-modules-core": "*"
+  }
+}

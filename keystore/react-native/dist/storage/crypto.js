@@ -1,0 +1,193 @@
+import { base64 } from "@scure/base";
+import * as Keychain from "react-native-keychain";
+import { randomBytes } from "react-native-quick-crypto";
+import { MasterKeyNotFoundError, UnlockingError } from "../errors.js";
+import { resolveAuthenticationPrompt } from "../prompts.js";
+/** AES-GCM IV length in bytes (96-bit, the recommended GCM nonce size). */
+const IV_LENGTH = 12;
+/**
+ * This module deliberately keeps **no** in-process copy of the master key.
+ *
+ * An earlier revision cached it in a module-level `Buffer` for 60 seconds to
+ * avoid prompt spam. That defeated the point of the whole design: the one key
+ * that decrypts everything at rest sat in plaintext JS memory, reachable by
+ * any code in the bundle and by anything that can read the heap, for a full
+ * minute after each unlock. The driver already reads → uses → wipes the key
+ * per operation, and prompt spam is now prevented at the OS level by
+ * {@link AuthenticationOptions.authenticationValidityDuration}, i.e. by the
+ * platform's own post-unlock reuse window, which never exposes the bytes.
+ */
+/** Casts a `Uint8Array` to the strict `BufferSource` overload WebCrypto expects. */
+function bs(bytes) {
+    return bytes;
+}
+/**
+ * Some StrongBox chips take about a second per AES operation, and a Keychain
+ * read costs two, so every master-key read stalls the app for seconds. When a
+ * read is that slow, the same master key is also stored under a key generated
+ * in the TEE, and that copy is read from then on. The StrongBox copy stays as
+ * it was, so a failed or interrupted copy never loses the key.
+ */
+const TEE_SERVICE = "app-secret-tee";
+// Android only; iOS ignores the storage option.
+const TEE_STORAGE = "KeystoreAESGCM_NoAuth_TEE";
+// A StrongBox read on a fast chip takes well under 300 ms even while other
+// reads queue; a slow one takes over 2 s.
+const SLOW_READ_MS = 1000;
+let hasTeeCopy;
+// Once per launch, so a device whose TEE write fails does not retry on every read.
+let isTeeCopyAttempted = false;
+async function copyToTee(password) {
+    try {
+        await Keychain.setGenericPassword("master", password, {
+            service: TEE_SERVICE,
+            storage: TEE_STORAGE,
+        });
+        const written = await Keychain.getGenericPassword({ service: TEE_SERVICE });
+        if (written && written.password === password) {
+            hasTeeCopy = true;
+            return;
+        }
+    }
+    catch {
+        // Falls through to the cleanup; the StrongBox copy is untouched.
+    }
+    await Keychain.resetGenericPassword({ service: TEE_SERVICE }).catch(() => undefined);
+}
+/**
+ * Reads the existing master key from the Keychain.
+ *
+ * This never creates a replacement key. A falsey Keychain result can mean
+ * either "missing" or "failed to read"; callers must decide whether creation
+ * is safe for their current storage state.
+ *
+ * @returns The master key as a Buffer
+ */
+export async function readMasterKey(options) {
+    // A biometric-bound master key keeps its access control; only plain keys move.
+    const canUseTee = !options?.biometrics;
+    if (canUseTee && hasTeeCopy !== false) {
+        const tee = await Keychain.getGenericPassword({ service: TEE_SERVICE });
+        hasTeeCopy = Boolean(tee);
+        if (tee)
+            return Buffer.from(tee.password, "hex");
+    }
+    const getOptions = {
+        service: "app-secret",
+        authenticationPrompt: resolveAuthenticationPrompt(options, undefined, {
+            operation: options?.operation,
+            keyId: options?.keyId,
+        }),
+    };
+    if (options?.authenticationValidityDuration !== undefined) {
+        getOptions.authenticationValidityDuration = options.authenticationValidityDuration;
+    }
+    const startedAt = Date.now();
+    const credentials = await Keychain.getGenericPassword(getOptions);
+    if (!credentials)
+        throw new MasterKeyNotFoundError();
+    if (canUseTee && !isTeeCopyAttempted && Date.now() - startedAt > SLOW_READ_MS) {
+        isTeeCopyAttempted = true;
+        void copyToTee(credentials.password);
+    }
+    return Buffer.from(credentials.password, "hex");
+}
+/**
+ * Creates and stores a new master key.
+ *
+ * Only call this from explicit initialization paths where there are no
+ * encrypted keystore records that depend on a previous master key.
+ *
+ * @returns The newly created master key as a Buffer
+ */
+export async function createMasterKey(options) {
+    const biometricOptions = options?.biometrics
+        ? {
+            // BIOMETRY_CURRENT_SET binds the item to the biometric set enrolled
+            // right now, so enrolling a new finger/face invalidates it — strictly
+            // safer, but destructive for legitimate re-enrolment, hence opt-in.
+            accessControl: options.invalidateOnEnrollment
+                ? Keychain.ACCESS_CONTROL.BIOMETRY_CURRENT_SET
+                : Keychain.ACCESS_CONTROL.BIOMETRY_ANY,
+            accessible: Keychain.ACCESSIBLE.WHEN_UNLOCKED_THIS_DEVICE_ONLY,
+            authenticationPrompt: resolveAuthenticationPrompt(options, undefined, {
+                operation: options.operation,
+                keyId: options.keyId,
+            }),
+        }
+        : {};
+    const setOptions = {
+        service: "app-secret",
+        ...biometricOptions,
+    };
+    // On Android this value is baked into the Keystore key here, at creation
+    // time; on iOS it only matters per read. Forward it on both paths.
+    if (options?.authenticationValidityDuration !== undefined) {
+        setOptions.authenticationValidityDuration = options.authenticationValidityDuration;
+    }
+    const newKey = Buffer.from(randomBytes(32)); // TODO: harden entropy
+    const result = await Keychain.setGenericPassword("master", newKey.toString("hex"), setOptions);
+    if (!result) {
+        throw new UnlockingError("Failed to store master key");
+    }
+    return Buffer.from(newKey);
+}
+/**
+ * Seals `data` at rest using the host {@link SubtleCrypto} AES-256-GCM, the
+ * same sealing scheme used by the web and node engines. A fresh 96-bit IV is
+ * drawn for every call.
+ *
+ * @param subtle - The host Subtle implementation (`react-native-quick-crypto`'s
+ *   `subtle` in production; Node's `globalThis.crypto.subtle` in tests).
+ * @param key - The AES-256 master key bytes.
+ * @param data - The plaintext string to seal.
+ * @returns A JSON string containing the base64 IV and base64 ciphertext (the
+ *   GCM authentication tag is appended to the ciphertext by Subtle).
+ */
+export async function sealData(subtle, key, data) {
+    const cryptoKey = await subtle.importKey("raw", bs(key), { name: "AES-GCM" }, false, [
+        "encrypt",
+        "decrypt",
+    ]);
+    const iv = crypto.getRandomValues(new Uint8Array(IV_LENGTH));
+    const plaintext = new TextEncoder().encode(data);
+    const ciphertext = new Uint8Array(await subtle.encrypt({ name: "AES-GCM", iv: bs(iv) }, cryptoKey, bs(plaintext)));
+    return JSON.stringify({
+        iv: base64.encode(iv),
+        content: base64.encode(ciphertext),
+    });
+}
+/**
+ * Opens a payload produced by {@link sealData} using the host
+ * {@link SubtleCrypto} AES-256-GCM.
+ *
+ * @param subtle - The host Subtle implementation (`react-native-quick-crypto`'s
+ *   `subtle` in production; Node's `globalThis.crypto.subtle` in tests).
+ * @param key - The AES-256 master key bytes.
+ * @param payload - The JSON string produced by {@link sealData}.
+ * @returns The decrypted plaintext string.
+ */
+export async function openData(subtle, key, payload) {
+    const { iv, tag, content } = JSON.parse(payload);
+    const cryptoKey = await subtle.importKey("raw", bs(key), { name: "AES-GCM" }, false, [
+        "encrypt",
+        "decrypt",
+    ]);
+    // Legacy payloads (quick-crypto `createCipheriv`) stored the GCM auth tag in a
+    // separate `tag` field, whereas Subtle expects it appended to the ciphertext.
+    // Concatenate for legacy `{iv,tag,content}` payloads; new `{iv,content}`
+    // payloads already carry the tag inside `content`. This keeps records sealed
+    // by the old scheme readable, so they migrate transparently on next write.
+    const ciphertext = typeof tag === "string"
+        ? (() => {
+            const body = base64.decode(content);
+            const authTag = base64.decode(tag);
+            const combined = new Uint8Array(body.byteLength + authTag.byteLength);
+            combined.set(body, 0);
+            combined.set(authTag, body.byteLength);
+            return combined;
+        })()
+        : base64.decode(content);
+    const plaintext = await subtle.decrypt({ name: "AES-GCM", iv: bs(base64.decode(iv)) }, cryptoKey, bs(ciphertext));
+    return new TextDecoder().decode(plaintext);
+}

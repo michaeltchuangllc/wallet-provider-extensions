@@ -28,8 +28,8 @@ catalogs:
       specifier: ^1.5.0
       version: 1.6.0
     '@tanstack/store':
-      specifier: ^0.9.0
-      version: 0.9.3
+      specifier: ^0.11.2
+      version: 0.11.2
     before-after-hook:
       specifier: ^4.0.0
       version: 4.0.0
@@ -171,7 +171,7 @@ importers:
         version: 2.0.0
       '@tanstack/store':
         specifier: 'catalog:'
-        version: 0.9.3
+        version: 0.11.2
       before-after-hook:
         specifier: 'catalog:'
         version: 4.0.0
@@ -202,7 +202,7 @@ importers:
         version: 2.0.0
       '@tanstack/store':
         specifier: 'catalog:'
-        version: 0.9.3
+        version: 0.11.2
       before-after-hook:
         specifier: 'catalog:'
         version: 4.0.0
@@ -248,7 +248,7 @@ importers:
         version: 1.6.0
       '@tanstack/store':
         specifier: 'catalog:'
-        version: 0.9.3
+        version: 0.11.2
       before-after-hook:
         specifier: 'catalog:'
         version: 4.0.0
@@ -318,7 +318,7 @@ importers:
         version: 0.9.3(react-dom@19.1.0(react@19.1.0))(react@19.1.0)
       '@tanstack/store':
         specifier: 'catalog:'
-        version: 0.9.3
+        version: 0.11.2
       before-after-hook:
         specifier: 'catalog:'
         version: 4.0.0
@@ -424,7 +424,7 @@ importers:
         version: 1.6.0
       '@tanstack/store':
         specifier: 'catalog:'
-        version: 0.9.3
+        version: 0.11.2
       before-after-hook:
         specifier: 'catalog:'
         version: 4.0.0
@@ -455,7 +455,7 @@ importers:
         version: 1.0.0-canary.5
       '@tanstack/store':
         specifier: 'catalog:'
-        version: 0.9.3
+        version: 0.11.2
       before-after-hook:
         specifier: 'catalog:'
         version: 4.0.0
@@ -483,7 +483,7 @@ importers:
         version: 2.0.0
       '@tanstack/store':
         specifier: 'catalog:'
-        version: 0.9.3
+        version: 0.11.2
       before-after-hook:
         specifier: 'catalog:'
         version: 4.0.0
@@ -505,7 +505,7 @@ importers:
         version: 2.0.0
       '@tanstack/store':
         specifier: 'catalog:'
-        version: 0.9.3
+        version: 0.11.2
       before-after-hook:
         specifier: 'catalog:'
         version: 4.0.0
@@ -540,7 +540,7 @@ importers:
         version: 2.0.0-canary.1
       '@tanstack/store':
         specifier: 'catalog:'
-        version: 0.9.3
+        version: 0.11.2
       before-after-hook:
         specifier: 'catalog:'
         version: 4.0.0
@@ -570,7 +570,7 @@ importers:
         version: link:../react-native
       '@tanstack/store':
         specifier: 'catalog:'
-        version: 0.9.3
+        version: 0.11.2
       before-after-hook:
         specifier: 'catalog:'
         version: 4.0.0
@@ -623,7 +623,7 @@ importers:
         version: link:../../build
       '@tanstack/store':
         specifier: 'catalog:'
-        version: 0.9.3
+        version: 0.11.2
       typedoc:
         specifier: 'catalog:'
         version: 0.26.11(typescript@5.9.3)
@@ -663,7 +663,7 @@ importers:
         version: 1.6.0
       '@tanstack/store':
         specifier: 'catalog:'
-        version: 0.9.3
+        version: 0.11.2
       before-after-hook:
         specifier: 'catalog:'
         version: 4.0.0
@@ -731,7 +731,7 @@ importers:
         version: link:../../build
       '@tanstack/store':
         specifier: 'catalog:'
-        version: 0.9.3
+        version: 0.11.2
       fake-indexeddb:
         specifier: ^6.2.5
         version: 6.2.5
@@ -753,7 +753,7 @@ importers:
         version: link:../build
       '@tanstack/store':
         specifier: 'catalog:'
-        version: 0.9.3
+        version: 0.11.2
       before-after-hook:
         specifier: 'catalog:'
         version: 4.0.0
@@ -770,6 +770,22 @@ importers:
       before-after-hook:
         specifier: 'catalog:'
         version: 4.0.0
+      vitest:
+        specifier: 'catalog:'
+        version: 4.1.2(@types/node@25.5.0)(jsdom@20.0.3(canvas@2.11.2))(vite@6.4.3(@types/node@25.5.0)(lightningcss@1.32.0)(terser@5.46.1)(tsx@4.23.1)(yaml@2.8.3))
+
+  seed-vault/react-native:
+    dependencies:
+      '@scure/base':
+        specifier: 'catalog:'
+        version: 2.0.0
+    devDependencies:
+      expo-modules-core:
+        specifier: 58.0.24
+        version: 58.0.24(react-native@0.81.5(@babel/core@7.29.7)(@types/react@19.1.17)(react@19.1.0))(react@19.1.0)
+      typescript:
+        specifier: 'catalog:'
+        version: 5.9.3
       vitest:
         specifier: 'catalog:'
         version: 4.1.2(@types/node@25.5.0)(jsdom@20.0.3(canvas@2.11.2))(vite@6.4.3(@types/node@25.5.0)(lightningcss@1.32.0)(terser@5.46.1)(tsx@4.23.1)(yaml@2.8.3))
@@ -1821,6 +1837,28 @@ packages:
 
   '@expo/metro@54.2.0':
     resolution: {integrity: sha512-h68TNZPGsk6swMmLm9nRSnE2UXm48rWwgcbtAHVMikXvbxdS41NDHHeqg1rcQ9AbznDRp6SQVC2MVpDnsRKU1w==}
+
+  '@expo/modules-macros-linux-arm64@0.22.0':
+    resolution: {integrity: sha512-FGXyxpZMEJ4pDPCeCBjfBjftCbk03P/1Rf6UkFoL22joqu4XXt+XUsjfTzyKBzP9pAXL39FVdbNClwk529CEEQ==}
+    cpu: [arm64]
+    os: [linux]
+    libc: [glibc]
+
+  '@expo/modules-macros-linux-x64@0.22.0':
+    resolution: {integrity: sha512-4yN4cZTCUWkq1Olr0/lA57gFan8+MEo7K3K0cx0bB3TUEqHgL/hyJN79vQKXlp9NWTnOxO7J5uwqMQkQwfh6aw==}
+    cpu: [x64]
+    os: [linux]
+    libc: [glibc]
+
+  '@expo/modules-macros-win32-arm64@0.22.0':
+    resolution: {integrity: sha512-nLDXRGZWKNERzP4zH9LdfdZ3jvPBQcQE7LX5UnWW4cnDE/GoiVyUKdXQFK+KRnMD6We5gxqhIOU6SLj74h6fHA==}
+    cpu: [arm64]
+    os: [win32]
+
+  '@expo/modules-macros-win32-x64@0.22.0':
+    resolution: {integrity: sha512-IT5/YsBTj2gnfNlxDfv3sC51rBudiSHbPFBKoPBbpwmTCMcQg1rmWVdUoiy7LLC48NNzm86wyMxHpSI5lkW1Gg==}
+    cpu: [x64]
+    os: [win32]
 
   '@expo/osascript@2.4.2':
     resolution: {integrity: sha512-/XP7PSYF2hzOZzqfjgkoWtllyeTN8dW3aM4P6YgKcmmPikKL5FdoyQhti4eh6RK5a5VrUXJTOlTNIpIHsfB5Iw==}
@@ -3034,6 +3072,9 @@ packages:
     peerDependencies:
       react: ^16.8.0 || ^17.0.0 || ^18.0.0 || ^19.0.0
       react-dom: ^16.8.0 || ^17.0.0 || ^18.0.0 || ^19.0.0
+
+  '@tanstack/store@0.11.2':
+    resolution: {integrity: sha512-sJ4mjol8uQsHV0gOJzzjwXfh2Fwm+Sz0+8deqiTm4jGbMdjzNSW+xZCFm0kUa870uhd8yi+DpKnZb5Kc4apa0Q==}
 
   '@tanstack/store@0.9.3':
     resolution: {integrity: sha512-8reSzl/qGWGGVKhBoxXPMWzATSbZLZFWhwBAFO9NAyp0TxzfBP0mIrGb8CP8KrQTmvzXlR/vFPPUrHTLBGyFyw==}
@@ -4618,6 +4659,24 @@ packages:
     peerDependencies:
       react: '*'
       react-native: '*'
+
+  expo-modules-core@58.0.24:
+    resolution: {integrity: sha512-RrE6FEWHJWpyazngFj2ZtpGrgf0sDWsl0Pa6TxHP9VD+Ns0Fju6E831d9nDary0PnGlGLHY31nJqfurOd2uEbg==}
+    peerDependencies:
+      react: '*'
+      react-native: '*'
+      react-native-worklets: '>=0.13.0'
+    peerDependenciesMeta:
+      react-native-worklets:
+        optional: true
+
+  expo-modules-jsi@58.0.23:
+    resolution: {integrity: sha512-ex3CnT8KLubsPjUG0RpEL5VgmpnWxf7Ouc+WXEr8jEbIwqcULEWtA2tfhGZwjg6jS3zeNwjygF1w8QSstP7JfQ==}
+    peerDependencies:
+      react-native: '*'
+
+  expo-modules-macros@0.22.0:
+    resolution: {integrity: sha512-IHY+FkILfG19qsyf9G/z7dcWVgsyqdkWsvvob3n5nWKa2meCCAGeEjp42N68fG8Ta6dn/bsceuma7uh2i6ho9g==}
 
   expo-router@6.0.23:
     resolution: {integrity: sha512-qCxVAiCrCyu0npky6azEZ6dJDMt77OmCzEbpF6RbUTlfkaCA417LvY14SBkk0xyGruSxy/7pvJOI6tuThaUVCA==}
@@ -8394,9 +8453,9 @@ snapshots:
 
   '@babel/helper-wrap-function@7.28.6':
     dependencies:
-      '@babel/template': 7.28.6
+      '@babel/template': 7.29.7
       '@babel/traverse': 7.29.0
-      '@babel/types': 7.29.0
+      '@babel/types': 7.29.8
     transitivePeerDependencies:
       - supports-color
 
@@ -9362,6 +9421,18 @@ snapshots:
       - bufferutil
       - supports-color
       - utf-8-validate
+
+  '@expo/modules-macros-linux-arm64@0.22.0':
+    optional: true
+
+  '@expo/modules-macros-linux-x64@0.22.0':
+    optional: true
+
+  '@expo/modules-macros-win32-arm64@0.22.0':
+    optional: true
+
+  '@expo/modules-macros-win32-x64@0.22.0':
+    optional: true
 
   '@expo/osascript@2.4.2':
     dependencies:
@@ -10596,6 +10667,8 @@ snapshots:
       react: 19.1.0
       react-dom: 19.1.0(react@19.1.0)
       use-sync-external-store: 1.6.0(react@19.1.0)
+
+  '@tanstack/store@0.11.2': {}
 
   '@tanstack/store@0.9.3': {}
 
@@ -12561,6 +12634,25 @@ snapshots:
       invariant: 2.2.4
       react: 19.1.0
       react-native: 0.81.5(@babel/core@7.29.7)(@types/react@19.1.17)(react@19.1.0)
+
+  expo-modules-core@58.0.24(react-native@0.81.5(@babel/core@7.29.7)(@types/react@19.1.17)(react@19.1.0))(react@19.1.0):
+    dependencies:
+      expo-modules-jsi: 58.0.23(react-native@0.81.5(@babel/core@7.29.7)(@types/react@19.1.17)(react@19.1.0))
+      expo-modules-macros: 0.22.0
+      invariant: 2.2.4
+      react: 19.1.0
+      react-native: 0.81.5(@babel/core@7.29.7)(@types/react@19.1.17)(react@19.1.0)
+
+  expo-modules-jsi@58.0.23(react-native@0.81.5(@babel/core@7.29.7)(@types/react@19.1.17)(react@19.1.0)):
+    dependencies:
+      react-native: 0.81.5(@babel/core@7.29.7)(@types/react@19.1.17)(react@19.1.0)
+
+  expo-modules-macros@0.22.0:
+    optionalDependencies:
+      '@expo/modules-macros-linux-arm64': 0.22.0
+      '@expo/modules-macros-linux-x64': 0.22.0
+      '@expo/modules-macros-win32-arm64': 0.22.0
+      '@expo/modules-macros-win32-x64': 0.22.0
 
   expo-router@6.0.23(95ab1cff946f2655d5c228a235fc1358):
     dependencies:
